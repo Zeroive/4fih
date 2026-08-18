@@ -1,7 +1,7 @@
 """DuQuant, adapted only to the six-function HiF4 demo interface.
 
-Smooth, one independent outlier-aware rotation per 64-channel group, zigzag
-permutation, then one independent rotation per newly formed group.
+Smooth, a searched multi-step outlier-aware block rotation, zigzag
+permutation, then a second independently searched multi-step rotation.
 No techniques from the other solution variants are included.
 """
 from __future__ import annotations
@@ -125,61 +125,74 @@ def _activation_absmax_and_samples(calib_activation_list, channels, device):
     return stat, samples
 
 
-def _block_householder(
-    x: torch.Tensor,
-    positions: torch.Tensor,
-) -> torch.Tensor:
-    """Apply an independent Householder transform to each 64-channel group.
+def _householder64(position: int, device: torch.device) -> torch.Tensor:
+    source = torch.zeros(64, dtype=torch.float32, device=device)
+    source[position] = 1.0
+    target = torch.full_like(source, 1.0 / 8.0)
+    v = source - target
+    return torch.eye(64, device=device) - 2.0 * torch.outer(v, v) / v.dot(v).clamp_min(EPS)
 
-    ``positions[g]`` identifies the outlier lane for group ``g``.  The
-    transform is evaluated in rank-1 form, so no ``[groups, 64, 64]`` dense
-    rotation tensor is materialized.
-    """
+
+def _block_rotate(x: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
     shape = x.shape
     y = x.float().reshape(*shape[:-1], -1, 64)
-    groups = y.shape[-2]
-    positions = positions.to(device=x.device, dtype=torch.long)
-    if positions.numel() != groups:
-        raise ValueError(
-            f"expected {groups} Householder positions, got {positions.numel()}"
-        )
-
-    # v_g = e_{positions[g]} - [1/8, ..., 1/8].  Each resulting H_g maps the
-    # selected coordinate axis to the uniform direction while remaining
-    # symmetric and orthogonal.
-    vectors = torch.full(
-        (groups, 64), -1.0 / 8.0, dtype=torch.float32, device=x.device
-    )
-    vectors[
-        torch.arange(groups, device=x.device), positions
-    ] += 1.0
-    coefficient = 2.0 * (y * vectors).sum(dim=-1, keepdim=True)
-    coefficient = coefficient / vectors.square().sum(
-        dim=-1, keepdim=True
-    ).clamp_min(EPS)
-    return (y - coefficient * vectors).reshape(shape)
+    return torch.matmul(y, rotation).reshape(shape)
 
 
-def _worst_local_positions(
-    samples: list[torch.Tensor],
-    groups: int,
-    device: torch.device,
-    positions: torch.Tensor | None = None,
-    perm: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Return one worst local lane for every 64-channel group."""
+def _worst_local_position(samples: list[torch.Tensor]) -> int:
     local = None
     for A in samples:
-        y = A
-        if positions is not None:
-            y = _block_householder(y, positions)
-        if perm is not None:
-            y = y.index_select(-1, perm)
-        score = y.abs().reshape(-1, groups, 64).amax(dim=0)
+        score = A.abs().reshape(-1, A.shape[-1] // 64, 64).amax(dim=(0, 1))
         local = score if local is None else torch.maximum(local, score)
-    if local is None:
-        return torch.zeros(groups, dtype=torch.long, device=device)
-    return local.argmax(dim=-1)
+    return 0 if local is None else int(local.argmax().item())
+
+
+DUQUANT_MAX_ROTATION_STEPS = 8
+
+
+def _activation_peak(samples: list[torch.Tensor]) -> float:
+    """Maximum absolute calibration value after the current rotation."""
+    peak = 0.0
+    for A in samples:
+        if A.numel():
+            peak = max(peak, float(A.abs().amax().item()))
+    return peak
+
+
+def _search_multistep_rotation(
+    samples: list[torch.Tensor],
+    device: torch.device,
+    max_steps: int = DUQUANT_MAX_ROTATION_STEPS,
+) -> tuple[torch.Tensor, int, float]:
+    """Greedily accumulate Householders and retain the lowest-peak depth.
+
+    All 64-channel groups share the cumulative rotation, matching the previous
+    implementation.  At every step the worst local lane is recomputed on the
+    already-rotated calibration activations.  Candidate depths 1..max_steps are
+    compared by their global activation peak.
+    """
+    identity = torch.eye(64, dtype=torch.float32, device=device)
+    if not samples or max_steps <= 0:
+        return identity, 0, _activation_peak(samples)
+
+    transformed = [A for A in samples]
+    cumulative = identity
+    best_rotation = identity
+    best_step = 0
+    best_peak = float("inf")
+
+    for step in range(1, max_steps + 1):
+        position = _worst_local_position(transformed)
+        update = _householder64(position, device)
+        transformed = [_block_rotate(A, update) for A in transformed]
+        cumulative = cumulative @ update
+        peak = _activation_peak(transformed)
+        if peak < best_peak:
+            best_peak = peak
+            best_step = step
+            best_rotation = cumulative.clone()
+
+    return best_rotation, best_step, best_peak
 
 
 def _zigzag_permutation(score: torch.Tensor) -> torch.Tensor:
@@ -203,31 +216,27 @@ def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activ
     w = W.abs().amax(dim=0)
     scale = a.clamp_min(EPS).pow(DUQUANT_ALPHA) / w.clamp_min(EPS).pow(1.0 - DUQUANT_ALPHA)
     smoothed = [A / scale for A in samples]
-    groups = W.shape[-1] // 64
 
-    pos1 = _worst_local_positions(smoothed, groups, W.device)
+    r1, r1_steps, r1_peak = _search_multistep_rotation(smoothed, W.device)
+    rotated = [_block_rotate(A, r1) for A in smoothed]
     channel_score = torch.zeros(W.shape[-1], device=W.device)
-    for A in smoothed:
-        channel_score = torch.maximum(
-            channel_score,
-            _block_householder(A, pos1).abs().amax(dim=0),
-        )
+    for A in rotated:
+        channel_score = torch.maximum(channel_score, A.abs().amax(dim=0))
     perm = _zigzag_permutation(channel_score)
-    pos2 = _worst_local_positions(
-        smoothed,
-        groups,
-        W.device,
-        positions=pos1,
-        perm=perm,
-    )
+    regrouped = [A.index_select(-1, perm) for A in rotated]
+    r2, r2_steps, r2_peak = _search_multistep_rotation(regrouped, W.device)
 
-    Wt = _block_householder(W * scale, pos1).index_select(-1, perm)
-    Wt = _block_householder(Wt, pos2)
+    Wt = _block_rotate(W * scale, r1).index_select(-1, perm)
+    Wt = _block_rotate(Wt, r2)
     state = {
         "smooth_scale": scale.detach().cpu(),
-        "rotation1_positions": pos1.detach().cpu(),
+        "rotation1": r1.detach().cpu(),
+        "rotation1_steps": r1_steps,
+        "rotation1_peak": r1_peak,
         "perm": perm.detach().cpu(),
-        "rotation2_positions": pos2.detach().cpu(),
+        "rotation2": r2.detach().cpu(),
+        "rotation2_steps": r2_steps,
+        "rotation2_peak": r2_peak,
     }
     return {"weight_params": _hif4_direct(Wt), "activation_state": state}
 
@@ -235,11 +244,11 @@ def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activ
 def hif4_dynamic_quantize_activation(activation_quant, activation_scale, activation_state):
     A = dequantize_nvfp4(activation_quant, activation_scale).float()
     scale = activation_state["smooth_scale"].to(A.device)
-    pos1 = activation_state["rotation1_positions"].to(A.device)
+    r1 = activation_state["rotation1"].to(A.device)
     perm = activation_state["perm"].to(A.device)
-    pos2 = activation_state["rotation2_positions"].to(A.device)
-    At = _block_householder(A / scale, pos1).index_select(-1, perm)
-    return _hif4_direct(_block_householder(At, pos2))
+    r2 = activation_state["rotation2"].to(A.device)
+    At = _block_rotate(A / scale, r1).index_select(-1, perm)
+    return _hif4_direct(_block_rotate(At, r2))
 
 
 # Attention is not changed by this paper-specific Linear ablation.
