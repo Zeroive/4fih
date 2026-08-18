@@ -5,9 +5,9 @@
 | 文件 | 相比前版新增内容 | 校准选择目标 | 相对开销 |
 | --- | --- | --- | --- |
 | `hif4_solution_v0.py` | 多起点 scale、精确 lv2/lv3、固定 Smooth、固定 magnitude sort | 加权张量 MSE | 1x |
-| `hif4_solution_v1.py` | 搜索 Linear Smooth alpha，并允许自动退回不做 Smooth | 量化后 `XWᵀ` 相对 MSE | 约 8x Linear 校准 |
-| `hif4_solution_v2.py` | 在 identity、magnitude sort、zigzag balance 中选择 regroup | 量化后 `XWᵀ` 相对 MSE | 约 24x Linear 校准 |
-| `hif4_solution_v3.py` | 搜索 Smooth-QK 强度，联合评估完整校准 token 的 QK logits | 量化后 `QKᵀ` 相对 MSE | 额外约 5x Attention 校准 |
+| `hif4_solution_v1.py` | 小样本搜索 Linear Smooth alpha，并允许自动退回不做 Smooth | 量化后 `XWᵀ` 相对 MSE | 8 个轻量候选 + 1 次完整量化 |
+| `hif4_solution_v2.py` | 在 identity、magnitude sort、zigzag balance 中选择 regroup | 量化后 `XWᵀ` 相对 MSE | 24 个轻量候选 + 1 次完整量化 |
+| `hif4_solution_v3.py` | 搜索 Smooth-QK 强度，联合评估完整校准 token 的 QK logits | 量化后 `QKᵀ` 相对 MSE | 额外 5 个 64-token 候选 |
 
 ## 建议实验顺序
 
@@ -19,10 +19,11 @@
 
 ## 设计约束
 
-- 搜索只使用最多 256 个 Linear calibration token、128 个 Attention token，防止校准时间和显存失控。
+- 搜索只使用最多 64 个 Linear calibration token、64 个 Attention token和 64 行 Weight；胜出策略才对完整 Weight 做一次正常量化。
+- v1–v3 的动态 A/Q/K/V 将 hierarchy 搜索从 v0 的 21 次降到 6 次；完整 Weight 仍使用 v0 的高质量搜索。
 - v1/v2 会保留 no-smoothing 候选；搜索结果不会被迫采用 Smooth。
 - v2 的 permutation 对 Weight 与动态 Activation 使用同一个索引，因此 full-precision GEMM 等价。
 - v3 的 Q/K 缩放互为倒数，因此 full-precision QK logits 等价。
 - V 不做 rotation/permutation，因为当前接口没有 O projection 或逆变换 hook。
 
-这些文件采用逐版导入以减少重复代码，适合在当前目录直接实验。如果提交环境只接受单文件，需要在确定最佳版本后将其与依赖版本合并成一个 `solution.py`。
+每个版本都是完整独立的单文件，不依赖目录中的其他 solution。
