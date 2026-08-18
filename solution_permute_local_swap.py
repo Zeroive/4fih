@@ -1,0 +1,386 @@
+"""HiF4 permutation: sorted initialization plus targeted local swap.
+
+Starts from the best six-alpha sort, then accepts only local swaps that reduce real HiF4 loss.
+Only Linear channel permutation and direct HiF4 conversion are used.  There is
+no smooth/AWQ transform and no HiF4 scale-factor search.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+
+
+EPS = 1e-12
+
+
+# =============================================================================
+# NVFP4 input decode
+# =============================================================================
+def dequantize_nvfp4(
+    quant_float: torch.Tensor,
+    scale_float: torch.Tensor,
+    blk_size: int = 16,
+) -> torch.Tensor:
+    channels = int(quant_float.shape[-1])
+    if channels % blk_size != 0:
+        raise ValueError(
+            f"last dimension {channels} is not divisible by block size {blk_size}"
+        )
+    x = quant_float.unflatten(-1, (-1, blk_size))
+    x = x * scale_float.unsqueeze(-1)
+    return x.flatten(-2, -1).to(torch.bfloat16)
+
+
+# =============================================================================
+# Fast direct HiF4 conversion
+# =============================================================================
+def _round_to_e6m2(x: torch.Tensor) -> torch.Tensor:
+    """Round positive FP32 values to finite unsigned E6M2 values."""
+    x = x.float().clamp(min=2.0**-48, max=(2.0**15) * 1.5)
+    exponent = torch.floor(torch.log2(x)).clamp(-48.0, 15.0)
+    base = torch.pow(torch.tensor(2.0, device=x.device), exponent)
+    mantissa = torch.round((x / base - 1.0) * 4.0)
+
+    carry = mantissa >= 4.0
+    exponent = torch.where(carry, exponent + 1.0, exponent)
+    mantissa = torch.where(carry, torch.zeros_like(mantissa), mantissa)
+
+    overflow = exponent > 15.0
+    exponent = torch.where(overflow, torch.full_like(exponent, 15.0), exponent)
+    mantissa = torch.where(overflow, torch.full_like(mantissa, 2.0), mantissa)
+    # Exponent 15, mantissa code 3 is reserved; saturate to the largest finite.
+    mantissa = torch.where(
+        (exponent >= 15.0) & (mantissa > 2.0),
+        torch.full_like(mantissa, 2.0),
+        mantissa,
+    ).clamp(0.0, 3.0)
+    return torch.pow(torch.tensor(2.0, device=x.device), exponent) * (
+        1.0 + mantissa * 0.25
+    )
+
+
+def _hif4_direct(x: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Convert contiguous groups of 64 with paper-style peak thresholds.
+
+    The operation is fully vectorized and performs no candidate or iterative
+    search.  A 64-value group is viewed as 8 x 2 x 4.
+    """
+    if x.shape[-1] % 64 != 0:
+        raise ValueError(f"HiF4 requires last dim divisible by 64, got {x.shape[-1]}")
+
+    xf = x.float()
+    groups = x.shape[-1] // 64
+    xg = xf.unflatten(-1, (groups, 8, 2, 4))
+    ax = xg.abs()
+
+    peak64 = ax.amax(dim=(-1, -2, -3), keepdim=True)
+    scale_factor = _round_to_e6m2(
+        (peak64 / 7.0).clamp_min(2.0**-48)
+    )
+
+    # One lv2 exponent is shared by 8 values.  lv2=2 is only needed when the
+    # local peak exceeds the range normally handled by the lv3 exponent.
+    peak8 = ax.amax(dim=(-1, -2), keepdim=True)
+    scale_lv2 = torch.where(
+        peak8 > 4.0 * scale_factor,
+        torch.full_like(peak8, 2.0),
+        torch.ones_like(peak8),
+    )
+
+    # One lv3 exponent is shared by 4 values.  Account for the already chosen
+    # lv2 multiplier before applying the second threshold.
+    peak4 = ax.amax(dim=-1, keepdim=True)
+    scale_lv3 = torch.where(
+        peak4 > 2.0 * scale_factor * scale_lv2,
+        torch.full_like(peak4, 2.0),
+        torch.ones_like(peak4),
+    )
+
+    local_scale = scale_factor * scale_lv2 * scale_lv3
+    mant = (torch.round((ax / local_scale.clamp_min(EPS)) * 4.0) * 0.25).clamp(
+        0.0, 1.75
+    )
+    sign = torch.where(mant > 0.0, torch.sign(xg), torch.zeros_like(xg))
+
+    out_dtype = torch.bfloat16
+    return {
+        "scale_factor": scale_factor.to(out_dtype),
+        "scale_lv2": scale_lv2.to(out_dtype),
+        "scale_lv3": scale_lv3.to(out_dtype),
+        "sign": sign.to(out_dtype),
+        "mant": mant.to(out_dtype),
+    }
+
+# =============================================================================
+# Permutation statistics and loss
+# =============================================================================
+def _second_moments(
+    W: torch.Tensor,
+    calib_activation_list: list,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    channels = W.shape[-1]
+    w2 = W.float().square().mean(dim=0).clamp_min(EPS)
+    act_sumsq = torch.zeros(channels, dtype=torch.float32, device=W.device)
+    count = 0
+    for activation_quant, activation_scale in calib_activation_list:
+        X = dequantize_nvfp4(activation_quant, activation_scale).to(
+            device=W.device, dtype=torch.float32
+        ).reshape(-1, channels)
+        act_sumsq += X.square().sum(dim=0)
+        count += X.shape[0]
+    if count == 0:
+        a2 = torch.ones_like(w2)
+    else:
+        a2 = (act_sumsq / count).clamp_min(EPS)
+    return w2, a2
+
+
+def _dequantize_hif4(params: dict[str, torch.Tensor]) -> torch.Tensor:
+    x = (
+        params["scale_factor"].float()
+        * params["scale_lv2"].float()
+        * params["scale_lv3"].float()
+        * params["sign"].float()
+        * params["mant"].float()
+    )
+    return x.flatten(-4, -1)
+
+
+def _weighted_losses(
+    Wp: torch.Tensor,
+    a2p: torch.Tensor,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    params = _hif4_direct(Wp)
+    Wq = _dequantize_hif4(params)
+    # Keep the raw activation second moment so full-tensor and two-group local
+    # evaluations use exactly the same additive objective.
+    importance = a2p
+    column_loss = importance * (Wp - Wq).square().mean(dim=0)
+    group_loss = column_loss.reshape(-1, 64).sum(dim=-1)
+    return params, group_loss, column_loss
+
+
+def _score(w2: torch.Tensor, a2: torch.Tensor, alpha: float) -> torch.Tensor:
+    # Log-domain form of a2**alpha * w2**(1-alpha), avoiding underflow.
+    return alpha * torch.log(a2) + (1.0 - alpha) * torch.log(w2)
+
+
+def _sorted_perm(w2: torch.Tensor, a2: torch.Tensor, alpha: float) -> torch.Tensor:
+    return torch.argsort(_score(w2, a2, alpha), descending=True)
+
+
+def _best_alpha_permutation(
+    W: torch.Tensor,
+    w2: torch.Tensor,
+    a2: torch.Tensor,
+) -> tuple[torch.Tensor, float | None, torch.Tensor]:
+    # Identity is a safety candidate: permutation is accepted only if its real
+    # activation-weighted HiF4 reconstruction loss is lower.
+    identity = torch.arange(W.shape[-1], device=W.device)
+    _, group_loss, _ = _weighted_losses(W, a2)
+    best_loss = group_loss.sum()
+    best_perm = identity
+    best_alpha = None
+
+    for alpha in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0):
+        perm = _sorted_perm(w2, a2, alpha)
+        _, candidate_group_loss, _ = _weighted_losses(
+            W.index_select(-1, perm), a2.index_select(0, perm)
+        )
+        loss = candidate_group_loss.sum()
+        if bool(loss < best_loss):
+            best_loss = loss
+            best_perm = perm
+            best_alpha = alpha
+    return best_perm, best_alpha, best_loss
+
+
+def _state(
+    perm: torch.Tensor,
+    strategy: str,
+    alpha: float | None,
+    weighted_loss: torch.Tensor,
+) -> dict[str, Any]:
+    return {
+        "perm": perm.detach().cpu(),
+        "strategy": strategy,
+        "alpha": alpha,
+        "weighted_hif4_loss": float(weighted_loss.item()),
+    }
+
+
+# =============================================================================
+# Dynamic Linear Activation
+# =============================================================================
+def hif4_dynamic_quantize_activation(
+    activation_quant: torch.Tensor,
+    activation_scale: torch.Tensor,
+    activation_state: Any,
+) -> dict[str, torch.Tensor]:
+    X = dequantize_nvfp4(activation_quant, activation_scale).float()
+    state = activation_state or {}
+    perm = state.get("perm", None)
+    if perm is not None:
+        X = X.index_select(-1, perm.to(X.device))
+    return _hif4_direct(X)
+
+
+# =============================================================================
+# Attention: direct HiF4, no permutation or calibration search
+# =============================================================================
+def hif4_calibration_attention(
+    calib_qkv_list: list,
+    q_num_heads: int,
+    kv_num_heads: int,
+    head_dim: int,
+) -> dict[str, Any]:
+    return {"q_state": None, "k_state": None, "v_state": None}
+
+
+def hif4_dynamic_quantize_q(
+    q_quant: torch.Tensor,
+    q_scale: torch.Tensor,
+    q_num_heads: int,
+    head_dim: int,
+    q_state: Any,
+) -> dict[str, torch.Tensor]:
+    return _hif4_direct(dequantize_nvfp4(q_quant, q_scale).float())
+
+
+def hif4_dynamic_quantize_k(
+    k_quant: torch.Tensor,
+    k_scale: torch.Tensor,
+    kv_num_heads: int,
+    head_dim: int,
+    k_state: Any,
+) -> dict[str, torch.Tensor]:
+    return _hif4_direct(dequantize_nvfp4(k_quant, k_scale).float())
+
+
+def hif4_dynamic_quantize_v(
+    v_quant: torch.Tensor,
+    v_scale: torch.Tensor,
+    kv_num_heads: int,
+    head_dim: int,
+    v_state: Any,
+) -> dict[str, torch.Tensor]:
+    return _hif4_direct(dequantize_nvfp4(v_quant, v_scale).float())
+
+
+# Targeted search limits.  One proposal requantizes only two [out, 64] groups.
+LOCAL_BAD_GROUPS = 6
+LOCAL_BAD_COLUMNS = 4
+LOCAL_NEIGHBORS = 6
+LOCAL_MAX_ACCEPTED_SWAPS = 8
+
+
+def _one_group_losses(
+    W: torch.Tensor,
+    a2: torch.Tensor,
+    indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    Wg = W.index_select(-1, indices)
+    _, _, column_loss = _weighted_losses(Wg, a2.index_select(0, indices))
+    return column_loss.sum(), column_loss
+
+
+def _targeted_local_swap(
+    W: torch.Tensor,
+    w2: torch.Tensor,
+    a2: torch.Tensor,
+    initial_perm: torch.Tensor,
+    alpha: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    perm = initial_perm.clone()
+    Wp = W.index_select(-1, perm)
+    a2p = a2.index_select(0, perm)
+    _, group_loss, column_loss = _weighted_losses(Wp, a2p)
+    groups = perm.numel() // 64
+
+    # If identity won, use the balanced joint statistic only to locate nearby
+    # candidate channels; acceptance still uses true HiF4 weighted loss.
+    target_alpha = 0.5 if alpha is None else alpha
+    channel_stat = _score(w2, a2, target_alpha)
+    accepted = 0
+
+    while accepted < LOCAL_MAX_ACCEPTED_SWAPS:
+        bad_count = min(LOCAL_BAD_GROUPS, groups)
+        bad_groups = torch.topk(group_loss, k=bad_count).indices
+        improved = False
+
+        for group_tensor in bad_groups:
+            g = int(group_tensor.item())
+            start = g * 64
+            local_bad_count = min(LOCAL_BAD_COLUMNS, 64)
+            bad_local = torch.topk(
+                column_loss[start : start + 64], k=local_bad_count
+            ).indices
+
+            for local_tensor in bad_local:
+                pos_i = start + int(local_tensor.item())
+                original_i = perm[pos_i]
+                distance = (channel_stat.index_select(0, perm) - channel_stat[original_i]).abs()
+                distance[start : start + 64] = float("inf")
+                neighbor_count = min(LOCAL_NEIGHBORS, perm.numel() - 64)
+                if neighbor_count <= 0:
+                    continue
+                candidate_positions = torch.topk(
+                    distance, k=neighbor_count, largest=False
+                ).indices
+
+                for pos_j_tensor in candidate_positions:
+                    pos_j = int(pos_j_tensor.item())
+                    h = pos_j // 64
+                    old_loss = group_loss[g] + group_loss[h]
+
+                    idx_g = perm[start : start + 64].clone()
+                    h_start = h * 64
+                    idx_h = perm[h_start : h_start + 64].clone()
+                    local_j = pos_j - h_start
+                    old_i = idx_g[local_tensor].clone()
+                    old_j = idx_h[local_j].clone()
+                    idx_g[local_tensor] = old_j
+                    idx_h[local_j] = old_i
+
+                    new_g, new_cols_g = _one_group_losses(W, a2, idx_g)
+                    new_h, new_cols_h = _one_group_losses(W, a2, idx_h)
+                    if bool(new_g + new_h < old_loss):
+                        perm[pos_i] = old_j
+                        perm[pos_j] = old_i
+                        group_loss[g] = new_g
+                        group_loss[h] = new_h
+                        column_loss[start : start + 64] = new_cols_g
+                        column_loss[h_start : h_start + 64] = new_cols_h
+                        accepted += 1
+                        improved = True
+                        break
+                if improved:
+                    break
+            if improved:
+                break
+        if not improved:
+            break
+
+    return perm, group_loss.sum(), accepted
+
+
+# =============================================================================
+# Linear calibration: best sorted initialization + targeted local swap
+# =============================================================================
+def hif4_calibration_and_quantize_weight(
+    weight_quant: torch.Tensor,
+    weight_scale: torch.Tensor,
+    calib_activation_list: list,
+) -> dict[str, Any]:
+    W = dequantize_nvfp4(weight_quant, weight_scale).float()
+    w2, a2 = _second_moments(W, calib_activation_list)
+    initial_perm, alpha, _ = _best_alpha_permutation(W, w2, a2)
+    perm, best_loss, accepted = _targeted_local_swap(
+        W, w2, a2, initial_perm, alpha
+    )
+    params = _hif4_direct(W.index_select(-1, perm))
+    state = _state(perm, "six_alpha_sort_plus_targeted_local_swap", alpha, best_loss)
+    state["accepted_swaps"] = accepted
+    return {"weight_params": params, "activation_state": state}
+

@@ -9,6 +9,9 @@
 | `hif4_solution_v2.py` | 在 identity、magnitude sort、zigzag balance 中选择 regroup | 量化后 `XWᵀ` 相对 MSE | 24 个轻量候选 + 1 次完整量化 |
 | `hif4_solution_v3.py` | 搜索 Smooth-QK 强度，联合评估完整校准 token 的 QK logits | 量化后 `QKᵀ` 相对 MSE | 额外 5 个 64-token 候选 |
 | `solution_awq.py` | 固定闭式 AWQ saliency + W/A RMS balance | 无搜索 | 一次统计 + 一次直接 HiF4 转换 |
+| `solution_permute_second_moment.py` | 固定 α=0.5 的 W/A joint second-moment sort | 无候选搜索 | 一次排序 |
+| `solution_permute_alpha6.py` | 6 个 α 排序，以真实 activation-weighted HiF4 loss 选优 | 只搜索 permutation | 6 次离线 Weight 转换 |
+| `solution_permute_local_swap.py` | 最佳 α sort 初始化 + targeted two-group swap | 只搜索 permutation | 有界局部搜索 |
 
 ## 建议实验顺序
 
