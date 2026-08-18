@@ -2,6 +2,29 @@
 
 A fixed signed Hadamard64 rotation is applied equivalently to Linear W/A and Attention Q/K.
 No techniques from the other solution variants are included.
+
+======================== Linear ========================
+[Linear][Group 0] calibration: PASSED [181.41ms] (W=(8192, 2048), num_calib=5)
+[Linear][Group 0][Test 0] activation: FAILED [4.07ms] (W=(8192, 2048), A=(10, 2048))
+      MatMul MSE 1.0345e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 1] activation: FAILED [6.88ms] (W=(8192, 2048), A=(128, 2048))
+      MatMul MSE 9.6093e-03 exceeds threshold 0.001
+[Linear][Group 0][Test 2] activation: FAILED [49.88ms] (W=(8192, 2048), A=(512, 2048))
+      MatMul MSE 8.9642e-03 exceeds threshold 0.001
+[Linear][Group 0][Test 3] activation: FAILED [18.13ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 8.7056e-03 exceeds threshold 0.001
+[Linear][Group 0][Test 4] activation: FAILED [19.18ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 8.6983e-03 exceeds threshold 0.001
+
+====================== Attention ======================
+[Attention][Group 0] calibration: PASSED [0.00ms] (q_heads=16, kv_heads=2, head_dim=256, num_calib=5)
+[Attention][Group 0][Test 0] FAILED [11.65ms] (Q=(10, 4096), K=(10, 512), V=(10, 512))
+      Attention MSE 1.1494e-03 exceeds threshold 0.001
+[Attention][Group 0][Test 1] PASSED (MSE=3.2892e-04) [34.63ms] (Q=(128, 4096), K=(128, 512), V=(128, 512))
+[Attention][Group 0][Test 2] PASSED (MSE=1.9756e-04) [142.79ms] (Q=(512, 4096), K=(512, 512), V=(512, 512))
+[Attention][Group 0][Test 3] PASSED (MSE=1.7040e-04) [137.48ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+[Attention][Group 0][Test 4] PASSED (MSE=1.7489e-04) [136.19ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+
 """
 from __future__ import annotations
 
