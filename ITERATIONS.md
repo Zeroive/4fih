@@ -8,6 +8,7 @@
 | `hif4_solution_v1.py` | 小样本搜索 Linear Smooth alpha，并允许自动退回不做 Smooth | 量化后 `XWᵀ` 相对 MSE | 8 个轻量候选 + 1 次完整量化 |
 | `hif4_solution_v2.py` | 在 identity、magnitude sort、zigzag balance 中选择 regroup | 量化后 `XWᵀ` 相对 MSE | 24 个轻量候选 + 1 次完整量化 |
 | `hif4_solution_v3.py` | 搜索 Smooth-QK 强度，联合评估完整校准 token 的 QK logits | 量化后 `QKᵀ` 相对 MSE | 额外 5 个 64-token 候选 |
+| `solution_awq.py` | 固定闭式 AWQ saliency + W/A RMS balance | 无搜索 | 一次统计 + 一次直接 HiF4 转换 |
 
 ## 建议实验顺序
 
@@ -27,3 +28,9 @@
 - V 不做 rotation/permutation，因为当前接口没有 O projection 或逆变换 hook。
 
 每个版本都是完整独立的单文件，不依赖目录中的其他 solution。
+
+## AWQ 快速消融
+
+`solution_awq.py` 默认使用 `beta=1, gamma=0.25`。若要做纯 W/A balance，设置
+`AWQ_SALIENCY_GAMMA = 0.0`；若要更接近 activation-only fixed AWQ，设置
+`AWQ_BALANCE_BETA = 0.0, AWQ_SALIENCY_GAMMA = 0.5`。
