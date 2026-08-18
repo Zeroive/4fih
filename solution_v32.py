@@ -354,10 +354,10 @@ def _quantize_k_softmax_quotient(k_quant: torch.Tensor, k_scale: torch.Tensor) -
 
 
 # =============================================================================
-# V32: V31 conservative Linear selection + safeguarded DuQuant R1 -> P -> R2.
+# V32: V31 selection + safeguarded Smooth -> DuQuant R1 -> P -> R2 -> H64.
 # V30 Attention remains unchanged.
 # =============================================================================
-_V32_STATE_VERSION = "v32_v31_plus_duquant_safe"
+_V32_STATE_VERSION = "v32_duquant_then_h64_safe"
 _V32_BASE_MODES = (
     (0.0, False), (0.25, False), (0.50, False),
     (0.0, True), (0.25, True), (0.50, True),
@@ -520,25 +520,31 @@ def _v32_apply_duquant(
     return _v32_householder64(x, position2)
 
 
-def _v32_build_and_check_duquant(
+def _v32_build_and_check_duquant_hadamard(
     weight: torch.Tensor,
     activations: list[torch.Tensor],
     smooth: torch.Tensor,
     use_hadamard: bool,
 ) -> tuple[bool, int, Optional[torch.Tensor], int]:
-    """Build R1/P/R2 and enable it only when it safely beats the V31 path."""
+    """Check Smooth -> R1 -> P -> R2 -> H64 against the selected V31 path."""
     if not activations or weight.shape[-1] % 64:
         return False, 0, None, 0
 
-    base_activations = [activation * smooth for activation in activations]
-    base_weight = weight / smooth
+    smoothed_activations = [activation * smooth for activation in activations]
+    smoothed_weight = weight / smooth
+
+    # This is the already-selected V31 candidate and remains the hard fallback.
+    base_activations = smoothed_activations
+    base_weight = smoothed_weight
     if use_hadamard:
         base_activations = [_fwht64_v32(x) for x in base_activations]
         base_weight = _fwht64_v32(base_weight)
 
-    position1 = _v32_worst_local_position(base_activations)
+    # The combined candidate intentionally does not use V31's optional pre-H64.
+    # It learns DuQuant on the smoothed tensors, then applies one H64 after R2.
+    position1 = _v32_worst_local_position(smoothed_activations)
     rotated_activations = [
-        _v32_householder64(x, position1) for x in base_activations
+        _v32_householder64(x, position1) for x in smoothed_activations
     ]
     channel_score = torch.stack(
         [x.abs().amax(dim=0) for x in rotated_activations]
@@ -549,20 +555,22 @@ def _v32_build_and_check_duquant(
     weight_rows = _v32_even(weight.shape[0], min(48, weight.shape[0]), weight.device)
     sampled_original_weight = weight[weight_rows]
     sampled_base_weight = base_weight[weight_rows]
-    sampled_duquant_weight = _v32_apply_duquant(
-        sampled_base_weight, position1, permutation, position2
+    sampled_combined_weight = _fwht64_v32(
+        _v32_apply_duquant(
+            smoothed_weight[weight_rows], position1, permutation, position2
+        )
     )
     _, base_weight_q = _quantize_tensor_self_mse(
         sampled_base_weight, return_dequant=True
     )
-    _, duquant_weight_q = _quantize_tensor_self_mse(
-        sampled_duquant_weight, return_dequant=True
+    _, combined_weight_q = _quantize_tensor_self_mse(
+        sampled_combined_weight, return_dequant=True
     )
 
     base_errors = []
-    duquant_errors = []
-    for original_activation, base_activation in zip(
-        activations[:4], base_activations[:4]
+    combined_errors = []
+    for original_activation, base_activation, smoothed_activation in zip(
+        activations[:4], base_activations[:4], smoothed_activations[:4]
     ):
         token_rows = _v32_even(
             original_activation.shape[0],
@@ -571,32 +579,34 @@ def _v32_build_and_check_duquant(
         )
         sampled_original_activation = original_activation[token_rows]
         sampled_base_activation = base_activation[token_rows]
-        sampled_duquant_activation = _v32_apply_duquant(
-            sampled_base_activation, position1, permutation, position2
+        sampled_combined_activation = _fwht64_v32(
+            _v32_apply_duquant(
+                smoothed_activation[token_rows], position1, permutation, position2
+            )
         )
         reference = sampled_original_activation @ sampled_original_weight.t()
         _, base_activation_q = _quantize_tensor_self_mse(
             sampled_base_activation, return_dequant=True
         )
-        _, duquant_activation_q = _quantize_tensor_self_mse(
-            sampled_duquant_activation, return_dequant=True
+        _, combined_activation_q = _quantize_tensor_self_mse(
+            sampled_combined_activation, return_dequant=True
         )
         base_errors.append(
             float((base_activation_q @ base_weight_q.t() - reference).square().mean())
         )
-        duquant_errors.append(
+        combined_errors.append(
             float(
                 (
-                    duquant_activation_q @ duquant_weight_q.t() - reference
+                    combined_activation_q @ combined_weight_q.t() - reference
                 ).square().mean()
             )
         )
 
     ratios = [
         candidate / max(base, 1e-20)
-        for candidate, base in zip(duquant_errors, base_errors)
+        for candidate, base in zip(combined_errors, base_errors)
     ]
-    pooled = sum(duquant_errors) / max(sum(base_errors), 1e-20)
+    pooled = sum(combined_errors) / max(sum(base_errors), 1e-20)
     enabled = bool(ratios and max(ratios) <= 0.99 and pooled <= 0.92)
     if not enabled:
         return False, 0, None, 0
@@ -613,17 +623,20 @@ def hif4_calibration_and_quantize_weight(
         calib_activation_list, weight.shape[-1], weight.device
     )
     smooth, use_hadamard, mode = _v32_choose_base_mode(weight, activations)
-    use_duquant, position1, permutation, position2 = _v32_build_and_check_duquant(
-        weight, activations, smooth, use_hadamard
+    use_combined, position1, permutation, position2 = (
+        _v32_build_and_check_duquant_hadamard(
+            weight, activations, smooth, use_hadamard
+        )
     )
 
     transformed_weight = weight / smooth
-    if use_hadamard:
+    if use_hadamard and not use_combined:
         transformed_weight = _fwht64_v32(transformed_weight)
-    if use_duquant:
+    if use_combined:
         transformed_weight = _v32_apply_duquant(
             transformed_weight, position1, permutation, position2
         )
+        transformed_weight = _fwht64_v32(transformed_weight)
 
     weight_params, _ = _quantize_tensor_self_mse(
         transformed_weight, return_dequant=False
@@ -631,11 +644,11 @@ def hif4_calibration_and_quantize_weight(
     state = {
         "version": _V32_STATE_VERSION,
         "smooth": smooth.detach().cpu().float(),
-        "hadamard64": use_hadamard,
+        "hadamard64": bool(use_hadamard and not use_combined),
         "beta": mode[0],
-        "duquant": use_duquant,
+        "duquant_hadamard": use_combined,
     }
-    if use_duquant:
+    if use_combined:
         state.update(
             {
                 "duquant_position1": int(position1),
@@ -655,9 +668,7 @@ def hif4_dynamic_quantize_activation(
     if isinstance(activation_state, dict) and "smooth" in activation_state:
         smooth = activation_state["smooth"].to(activation.device)
         activation = activation * smooth
-        if bool(activation_state.get("hadamard64", False)):
-            activation = _fwht64_v32(activation)
-        if bool(activation_state.get("duquant", False)):
+        if bool(activation_state.get("duquant_hadamard", False)):
             permutation = activation_state["duquant_permutation"].to(
                 activation.device
             )
@@ -667,6 +678,9 @@ def hif4_dynamic_quantize_activation(
                 permutation,
                 int(activation_state["duquant_position2"]),
             )
+            activation = _fwht64_v32(activation)
+        elif bool(activation_state.get("hadamard64", False)):
+            activation = _fwht64_v32(activation)
     return _quantize_tensor_self_mse(activation, return_dequant=False)[0]
 
 
