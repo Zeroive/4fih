@@ -1,0 +1,28 @@
+# HiF4 迭代版本说明
+
+所有版本保留 v0 的六个公开接口，后一个版本在前一个版本之上增加一项可独立消融的能力。
+
+| 文件 | 相比前版新增内容 | 校准选择目标 | 相对开销 |
+| --- | --- | --- | --- |
+| `hif4_solution_v0.py` | 多起点 scale、精确 lv2/lv3、固定 Smooth、固定 magnitude sort | 加权张量 MSE | 1x |
+| `hif4_solution_v1.py` | 搜索 Linear Smooth alpha，并允许自动退回不做 Smooth | 量化后 `XWᵀ` 相对 MSE | 约 8x Linear 校准 |
+| `hif4_solution_v2.py` | 在 identity、magnitude sort、zigzag balance 中选择 regroup | 量化后 `XWᵀ` 相对 MSE | 约 24x Linear 校准 |
+| `hif4_solution_v3.py` | 搜索 Smooth-QK 强度，联合评估完整校准 token 的 QK logits | 量化后 `QKᵀ` 相对 MSE | 额外约 5x Attention 校准 |
+
+## 建议实验顺序
+
+1. 先对 v0、v1 做 A/B，确认 output-aware alpha search 的收益。
+2. 再跑 v2，读取 `activation_state["permutation_strategy"]` 和
+   `activation_state["calibration_relative_output_mse"]`，观察不同层选择是否稳定。
+3. 最后跑 v3，读取 `q_state["smooth_beta"]` 和
+   `k_state["calibration_relative_qk_mse"]`。
+
+## 设计约束
+
+- 搜索只使用最多 256 个 Linear calibration token、128 个 Attention token，防止校准时间和显存失控。
+- v1/v2 会保留 no-smoothing 候选；搜索结果不会被迫采用 Smooth。
+- v2 的 permutation 对 Weight 与动态 Activation 使用同一个索引，因此 full-precision GEMM 等价。
+- v3 的 Q/K 缩放互为倒数，因此 full-precision QK logits 等价。
+- V 不做 rotation/permutation，因为当前接口没有 O projection 或逆变换 hook。
+
+这些文件采用逐版导入以减少重复代码，适合在当前目录直接实验。如果提交环境只接受单文件，需要在确定最佳版本后将其与依赖版本合并成一个 `solution.py`。
