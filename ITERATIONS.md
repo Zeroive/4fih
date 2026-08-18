@@ -32,6 +32,18 @@
 
 每个版本都是完整独立的单文件，不依赖目录中的其他 solution。
 
+## 论文独立复现版本
+
+- `solution_zeroquant.py`
+- `solution_smoothquant.py`
+- `solution_omniquant.py`
+- `solution_quarot.py`
+- `solution_duquant.py`
+- `solution_duquantpp.py`
+- `solution_tail_aware_hif4.py`
+
+这些文件每份只包含对应论文逻辑和基础 HiF4 转换。Atom、OSC、FPTQuant 所需接口缺口见 `INTERFACE_LIMITATIONS.md`。
+
 ## AWQ 快速消融
 
 `solution_awq.py` 默认使用 `beta=1, gamma=0.25`。若要做纯 W/A balance，设置
