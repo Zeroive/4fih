@@ -2,6 +2,28 @@
 
 R1 follows the existing DuQuant solution's outlier-targeted Householder logic.
 Standalone implementation for the six-function demo interface.
+======================== Linear ========================
+[Linear][Group 0] calibration: PASSED [241.57ms] (W=(8192, 2048), num_calib=5)
+[Linear][Group 0][Test 0] activation: FAILED [2.40ms] (W=(8192, 2048), A=(10, 2048))
+      MatMul MSE 5.7128e-03 exceeds threshold 0.001
+[Linear][Group 0][Test 1] activation: FAILED [5.01ms] (W=(8192, 2048), A=(128, 2048))
+      MatMul MSE 5.5278e-03 exceeds threshold 0.001
+[Linear][Group 0][Test 2] activation: FAILED [9.48ms] (W=(8192, 2048), A=(512, 2048))
+      MatMul MSE 4.4321e-03 exceeds threshold 0.001
+[Linear][Group 0][Test 3] activation: FAILED [18.95ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 4.2131e-03 exceeds threshold 0.001
+[Linear][Group 0][Test 4] activation: FAILED [16.45ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 4.1755e-03 exceeds threshold 0.001
+
+====================== Attention ======================
+[Attention][Group 0] calibration: PASSED [0.00ms] (q_heads=16, kv_heads=2, head_dim=256, num_calib=5)
+[Attention][Group 0][Test 0] FAILED [6.65ms] (Q=(10, 4096), K=(10, 512), V=(10, 512))
+      Attention MSE 1.0388e-03 exceeds threshold 0.001
+[Attention][Group 0][Test 1] PASSED (MSE=4.0943e-04) [25.86ms] (Q=(128, 4096), K=(128, 512), V=(128, 512))
+[Attention][Group 0][Test 2] PASSED (MSE=2.8481e-04) [50.14ms] (Q=(512, 4096), K=(512, 512), V=(512, 512))
+[Attention][Group 0][Test 3] PASSED (MSE=2.1662e-04) [86.83ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+[Attention][Group 0][Test 4] PASSED (MSE=2.3384e-04) [128.82ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+
 """
 from __future__ import annotations
 
