@@ -5,25 +5,27 @@ Only Linear channel permutation and direct HiF4 conversion are used.  There is
 no smooth/AWQ transform and no HiF4 scale-factor search.
 
 ======================== Linear ========================
-[Linear][Group 0] calibration: PASSED [1326.42ms] (W=(8192, 2048), num_calib=5)
-[Linear][Group 0][Test 0] activation: FAILED [15.87ms] (W=(8192, 2048), A=(10, 2048))
-      MatMul MSE 4.4571e-03 exceeds threshold 0.001
-[Linear][Group 0][Test 1] activation: FAILED [19.36ms] (W=(8192, 2048), A=(128, 2048))
-      MatMul MSE 4.2742e-03 exceeds threshold 0.001
-[Linear][Group 0][Test 2] activation: FAILED [107.49ms] (W=(8192, 2048), A=(512, 2048))
-      MatMul MSE 3.6569e-03 exceeds threshold 0.001
-[Linear][Group 0][Test 3] activation: FAILED [90.49ms] (W=(8192, 2048), A=(1024, 2048))
-      MatMul MSE 3.5108e-03 exceeds threshold 0.001
-[Linear][Group 0][Test 4] activation: FAILED [85.43ms] (W=(8192, 2048), A=(1024, 2048))
-      MatMul MSE 3.3962e-03 exceeds threshold 0.001
+[Linear][Group 0] calibration: PASSED [1548.65ms] (W=(8192, 2048), num_calib=5)
+[Linear][Group 0][Test 0] activation: FAILED [2.55ms] (W=(8192, 2048), A=(10, 2048))
+      MatMul MSE 2.1228e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 1] activation: FAILED [5.65ms] (W=(8192, 2048), A=(128, 2048))
+      MatMul MSE 1.6638e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 2] activation: FAILED [12.61ms] (W=(8192, 2048), A=(512, 2048))
+      MatMul MSE 1.6812e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 3] activation: FAILED [31.30ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 1.5657e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 4] activation: FAILED [21.59ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 1.6793e-02 exceeds threshold 0.001
 
 ====================== Attention ======================
-[Attention][Group 0] calibration: PASSED [0.01ms] (q_heads=16, kv_heads=2, head_dim=256, num_calib=5)
-[Attention][Group 0][Test 0] PASSED (MSE=8.4295e-04) [337.67ms] (Q=(10, 4096), K=(10, 512), V=(10, 512))
-[Attention][Group 0][Test 1] PASSED (MSE=2.6386e-04) [597.25ms] (Q=(128, 4096), K=(128, 512), V=(128, 512))
-[Attention][Group 0][Test 2] PASSED (MSE=1.5081e-04) [937.96ms] (Q=(512, 4096), K=(512, 512), V=(512, 512))
-[Attention][Group 0][Test 3] PASSED (MSE=1.2206e-04) [1464.30ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
-[Attention][Group 0][Test 4] PASSED (MSE=1.2945e-04) [1448.49ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+[Attention][Group 0] calibration: PASSED [0.00ms] (q_heads=16, kv_heads=2, head_dim=256, num_calib=5)
+[Attention][Group 0][Test 0] FAILED [14.83ms] (Q=(10, 4096), K=(10, 512), V=(10, 512))
+      Attention MSE 1.0388e-03 exceeds threshold 0.001
+[Attention][Group 0][Test 1] PASSED (MSE=4.0943e-04) [39.43ms] (Q=(128, 4096), K=(128, 512), V=(128, 512))
+[Attention][Group 0][Test 2] PASSED (MSE=2.8481e-04) [142.79ms] (Q=(512, 4096), K=(512, 512), V=(512, 512))
+[Attention][Group 0][Test 3] PASSED (MSE=2.1662e-04) [191.96ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+[Attention][Group 0][Test 4] PASSED (MSE=2.3384e-04) [144.98ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+
 
 """
 from __future__ import annotations
