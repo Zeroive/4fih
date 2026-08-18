@@ -1,29 +1,8 @@
 """DuQuant, adapted only to the six-function HiF4 demo interface.
 
-Smooth, one outlier-aware block rotation, zigzag permutation, then a second block rotation.
+Smooth, one independent outlier-aware rotation per 64-channel group, zigzag
+permutation, then one independent rotation per newly formed group.
 No techniques from the other solution variants are included.
-
-======================== Linear ========================
-[Linear][Group 0] calibration: PASSED [163.09ms] (W=(8192, 2048), num_calib=5)
-[Linear][Group 0][Test 0] activation: FAILED [1.92ms] (W=(8192, 2048), A=(10, 2048))
-      MatMul MSE 6.9769e-03 exceeds threshold 0.001
-[Linear][Group 0][Test 1] activation: FAILED [3.99ms] (W=(8192, 2048), A=(128, 2048))
-      MatMul MSE 6.0195e-03 exceeds threshold 0.001
-[Linear][Group 0][Test 2] activation: FAILED [10.12ms] (W=(8192, 2048), A=(512, 2048))
-      MatMul MSE 4.9995e-03 exceeds threshold 0.001
-[Linear][Group 0][Test 3] activation: FAILED [44.91ms] (W=(8192, 2048), A=(1024, 2048))
-      MatMul MSE 4.8313e-03 exceeds threshold 0.001
-[Linear][Group 0][Test 4] activation: FAILED [13.49ms] (W=(8192, 2048), A=(1024, 2048))
-      MatMul MSE 4.6972e-03 exceeds threshold 0.001
-
-====================== Attention ======================
-[Attention][Group 0] calibration: PASSED [0.00ms] (q_heads=16, kv_heads=2, head_dim=256, num_calib=5)
-[Attention][Group 0][Test 0] FAILED [8.15ms] (Q=(10, 4096), K=(10, 512), V=(10, 512))
-      Attention MSE 1.0388e-03 exceeds threshold 0.001
-[Attention][Group 0][Test 1] PASSED (MSE=4.0943e-04) [28.05ms] (Q=(128, 4096), K=(128, 512), V=(128, 512))
-[Attention][Group 0][Test 2] PASSED (MSE=2.8481e-04) [54.73ms] (Q=(512, 4096), K=(512, 512), V=(512, 512))
-[Attention][Group 0][Test 3] PASSED (MSE=2.1662e-04) [108.12ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
-[Attention][Group 0][Test 4] PASSED (MSE=2.3384e-04) [120.75ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
 """
 from __future__ import annotations
 
@@ -146,31 +125,61 @@ def _activation_absmax_and_samples(calib_activation_list, channels, device):
     return stat, samples
 
 
-def _householder64(position: int, device: torch.device) -> torch.Tensor:
-    source = torch.zeros(64, dtype=torch.float32, device=device)
-    source[position] = 1.0
-    target = torch.full_like(source, 1.0 / 8.0)
-    v = source - target
-    return torch.eye(64, device=device) - 2.0 * torch.outer(v, v) / v.dot(v).clamp_min(EPS)
+def _block_householder(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+) -> torch.Tensor:
+    """Apply an independent Householder transform to each 64-channel group.
 
-
-def _block_rotate(x: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
+    ``positions[g]`` identifies the outlier lane for group ``g``.  The
+    transform is evaluated in rank-1 form, so no ``[groups, 64, 64]`` dense
+    rotation tensor is materialized.
+    """
     shape = x.shape
     y = x.float().reshape(*shape[:-1], -1, 64)
-    return torch.matmul(y, rotation).reshape(shape)
+    groups = y.shape[-2]
+    positions = positions.to(device=x.device, dtype=torch.long)
+    if positions.numel() != groups:
+        raise ValueError(
+            f"expected {groups} Householder positions, got {positions.numel()}"
+        )
+
+    # v_g = e_{positions[g]} - [1/8, ..., 1/8].  Each resulting H_g maps the
+    # selected coordinate axis to the uniform direction while remaining
+    # symmetric and orthogonal.
+    vectors = torch.full(
+        (groups, 64), -1.0 / 8.0, dtype=torch.float32, device=x.device
+    )
+    vectors[
+        torch.arange(groups, device=x.device), positions
+    ] += 1.0
+    coefficient = 2.0 * (y * vectors).sum(dim=-1, keepdim=True)
+    coefficient = coefficient / vectors.square().sum(
+        dim=-1, keepdim=True
+    ).clamp_min(EPS)
+    return (y - coefficient * vectors).reshape(shape)
 
 
-def _worst_local_position(samples: list[torch.Tensor], rotation=None, perm=None) -> int:
+def _worst_local_positions(
+    samples: list[torch.Tensor],
+    groups: int,
+    device: torch.device,
+    positions: torch.Tensor | None = None,
+    perm: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return one worst local lane for every 64-channel group."""
     local = None
     for A in samples:
         y = A
-        if rotation is not None:
-            y = _block_rotate(y, rotation)
+        if positions is not None:
+            y = _block_householder(y, positions)
         if perm is not None:
             y = y.index_select(-1, perm)
-        score = y.abs().reshape(-1, y.shape[-1] // 64, 64).amax(dim=(0, 1))
+        score = y.abs().reshape(-1, groups, 64).amax(dim=0)
         local = score if local is None else torch.maximum(local, score)
-    return 0 if local is None else int(local.argmax().item())
+    if local is None:
+        return torch.zeros(groups, dtype=torch.long, device=device)
+    return local.argmax(dim=-1)
 
 
 def _zigzag_permutation(score: torch.Tensor) -> torch.Tensor:
@@ -194,23 +203,31 @@ def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activ
     w = W.abs().amax(dim=0)
     scale = a.clamp_min(EPS).pow(DUQUANT_ALPHA) / w.clamp_min(EPS).pow(1.0 - DUQUANT_ALPHA)
     smoothed = [A / scale for A in samples]
+    groups = W.shape[-1] // 64
 
-    pos1 = _worst_local_position(smoothed)
-    r1 = _householder64(pos1, W.device)
+    pos1 = _worst_local_positions(smoothed, groups, W.device)
     channel_score = torch.zeros(W.shape[-1], device=W.device)
     for A in smoothed:
-        channel_score = torch.maximum(channel_score, _block_rotate(A, r1).abs().amax(dim=0))
+        channel_score = torch.maximum(
+            channel_score,
+            _block_householder(A, pos1).abs().amax(dim=0),
+        )
     perm = _zigzag_permutation(channel_score)
-    pos2 = _worst_local_position(smoothed, rotation=r1, perm=perm)
-    r2 = _householder64(pos2, W.device)
+    pos2 = _worst_local_positions(
+        smoothed,
+        groups,
+        W.device,
+        positions=pos1,
+        perm=perm,
+    )
 
-    Wt = _block_rotate(W * scale, r1).index_select(-1, perm)
-    Wt = _block_rotate(Wt, r2)
+    Wt = _block_householder(W * scale, pos1).index_select(-1, perm)
+    Wt = _block_householder(Wt, pos2)
     state = {
         "smooth_scale": scale.detach().cpu(),
-        "rotation1": r1.detach().cpu(),
+        "rotation1_positions": pos1.detach().cpu(),
         "perm": perm.detach().cpu(),
-        "rotation2": r2.detach().cpu(),
+        "rotation2_positions": pos2.detach().cpu(),
     }
     return {"weight_params": _hif4_direct(Wt), "activation_state": state}
 
@@ -218,11 +235,11 @@ def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activ
 def hif4_dynamic_quantize_activation(activation_quant, activation_scale, activation_state):
     A = dequantize_nvfp4(activation_quant, activation_scale).float()
     scale = activation_state["smooth_scale"].to(A.device)
-    r1 = activation_state["rotation1"].to(A.device)
+    pos1 = activation_state["rotation1_positions"].to(A.device)
     perm = activation_state["perm"].to(A.device)
-    r2 = activation_state["rotation2"].to(A.device)
-    At = _block_rotate(A / scale, r1).index_select(-1, perm)
-    return _hif4_direct(_block_rotate(At, r2))
+    pos2 = activation_state["rotation2_positions"].to(A.device)
+    At = _block_householder(A / scale, pos1).index_select(-1, perm)
+    return _hif4_direct(_block_householder(At, pos2))
 
 
 # Attention is not changed by this paper-specific Linear ablation.
@@ -263,4 +280,3 @@ def hif4_dynamic_quantize_v(
     v_state: Any,
 ) -> dict[str, torch.Tensor]:
     return _hif4_direct(dequantize_nvfp4(v_quant, v_scale).float())
-
