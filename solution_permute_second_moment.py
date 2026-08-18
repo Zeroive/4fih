@@ -3,6 +3,28 @@
 Uses the PermuQuant joint statistic with fixed alpha=0.5 and one argsort.
 Only Linear channel permutation and direct HiF4 conversion are used.  There is
 no smooth/AWQ transform and no HiF4 scale-factor search.
+======================== Linear ========================
+[Linear][Group 0] calibration: PASSED [160.27ms] (W=(8192, 2048), num_calib=5)
+[Linear][Group 0][Test 0] activation: FAILED [1.90ms] (W=(8192, 2048), A=(10, 2048))
+      MatMul MSE 2.1347e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 1] activation: FAILED [3.77ms] (W=(8192, 2048), A=(128, 2048))
+      MatMul MSE 2.0726e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 2] activation: FAILED [74.25ms] (W=(8192, 2048), A=(512, 2048))
+      MatMul MSE 2.1631e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 3] activation: FAILED [12.68ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 2.1173e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 4] activation: FAILED [12.44ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 2.1454e-02 exceeds threshold 0.001
+
+====================== Attention ======================
+[Attention][Group 0] calibration: PASSED [0.00ms] (q_heads=16, kv_heads=2, head_dim=256, num_calib=5)
+[Attention][Group 0][Test 0] FAILED [10.45ms] (Q=(10, 4096), K=(10, 512), V=(10, 512))
+      Attention MSE 1.0388e-03 exceeds threshold 0.001
+[Attention][Group 0][Test 1] PASSED (MSE=4.0943e-04) [24.87ms] (Q=(128, 4096), K=(128, 512), V=(128, 512))
+[Attention][Group 0][Test 2] PASSED (MSE=2.8481e-04) [61.61ms] (Q=(512, 4096), K=(512, 512), V=(512, 512))
+[Attention][Group 0][Test 3] PASSED (MSE=2.1662e-04) [129.69ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+[Attention][Group 0][Test 4] PASSED (MSE=2.3384e-04) [93.45ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+
 """
 from __future__ import annotations
 
