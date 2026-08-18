@@ -4,6 +4,40 @@ Implements learnable equivalent per-channel scaling (LET scale) and learnable
 Weight clipping (LWC), optimized against HiF4 layer-output reconstruction.
 The LET shift is intentionally omitted because this interface has no bias hook.
 No techniques from the other solution variants are included.
+"D:\Program Files\uv\bin\uv.exe" run D:/DeskTop/26算法大赛/example/.venv/Scripts/python.exe D:\DeskTop\26算法大赛\example\example_0818\self_check_.py --datasets_dir mini_sample --solution_dir solution_test 
+Interface check: PASSED (6/6 functions found)
+
+======================== Linear ========================
+[Linear][Group 0] calibration: PASSED [4019.96ms] (W=(8192, 2048), num_calib=5)
+[Linear][Group 0][Test 0] activation: FAILED [3.44ms] (W=(8192, 2048), A=(10, 2048))
+      MatMul MSE 1.6805e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 1] activation: FAILED [4.84ms] (W=(8192, 2048), A=(128, 2048))
+      MatMul MSE 1.6075e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 2] activation: FAILED [6.22ms] (W=(8192, 2048), A=(512, 2048))
+      MatMul MSE 1.4444e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 3] activation: FAILED [11.90ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 1.3490e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 4] activation: FAILED [11.17ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 1.3363e-02 exceeds threshold 0.001
+
+====================== Attention ======================
+[Attention][Group 0] calibration: PASSED [0.00ms] (q_heads=16, kv_heads=2, head_dim=256, num_calib=5)
+[Attention][Group 0][Test 0] FAILED [7.00ms] (Q=(10, 4096), K=(10, 512), V=(10, 512))
+      Attention MSE 1.0388e-03 exceeds threshold 0.001
+[Attention][Group 0][Test 1] PASSED (MSE=4.0943e-04) [23.84ms] (Q=(128, 4096), K=(128, 512), V=(128, 512))
+[Attention][Group 0][Test 2] PASSED (MSE=2.8481e-04) [53.80ms] (Q=(512, 4096), K=(512, 512), V=(512, 512))
+[Attention][Group 0][Test 3] PASSED (MSE=2.1662e-04) [136.30ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+[Attention][Group 0][Test 4] PASSED (MSE=2.3384e-04) [89.29ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+
+======================== Summary ========================
+Passed checks: 6/12
+Failed checks: 6/12
+Avg Calibration Time: 2009.98 ms
+Avg Inference (Dynamic Quant) Time: 34.78 ms
+SOME OUTPUT-FORMAT OR PRECISION CHECKS FAILED
+
+Process finished with exit code 1
+
 """
 from __future__ import annotations
 
