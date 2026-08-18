@@ -3,6 +3,28 @@
 Starts from the best six-alpha sort, then accepts only local swaps that reduce real HiF4 loss.
 Only Linear channel permutation and direct HiF4 conversion are used.  There is
 no smooth/AWQ transform and no HiF4 scale-factor search.
+======================== Linear ========================
+[Linear][Group 0] calibration: PASSED [2334.40ms] (W=(8192, 2048), num_calib=5)
+[Linear][Group 0][Test 0] activation: FAILED [2.81ms] (W=(8192, 2048), A=(10, 2048))
+      MatMul MSE 2.3495e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 1] activation: FAILED [4.61ms] (W=(8192, 2048), A=(128, 2048))
+      MatMul MSE 1.6737e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 2] activation: FAILED [9.62ms] (W=(8192, 2048), A=(512, 2048))
+      MatMul MSE 1.6468e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 3] activation: FAILED [18.15ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 1.5874e-02 exceeds threshold 0.001
+[Linear][Group 0][Test 4] activation: FAILED [17.41ms] (W=(8192, 2048), A=(1024, 2048))
+      MatMul MSE 1.6684e-02 exceeds threshold 0.001
+
+====================== Attention ======================
+[Attention][Group 0] calibration: PASSED [0.00ms] (q_heads=16, kv_heads=2, head_dim=256, num_calib=5)
+[Attention][Group 0][Test 0] FAILED [10.07ms] (Q=(10, 4096), K=(10, 512), V=(10, 512))
+      Attention MSE 1.0388e-03 exceeds threshold 0.001
+[Attention][Group 0][Test 1] PASSED (MSE=4.0943e-04) [30.59ms] (Q=(128, 4096), K=(128, 512), V=(128, 512))
+[Attention][Group 0][Test 2] PASSED (MSE=2.8481e-04) [61.64ms] (Q=(512, 4096), K=(512, 512), V=(512, 512))
+[Attention][Group 0][Test 3] PASSED (MSE=2.1662e-04) [150.57ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+[Attention][Group 0][Test 4] PASSED (MSE=2.3384e-04) [108.95ms] (Q=(1024, 4096), K=(1024, 512), V=(1024, 512))
+
 """
 from __future__ import annotations
 
