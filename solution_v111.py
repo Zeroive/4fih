@@ -693,7 +693,9 @@ def _safe90_geometry(w, acts, *, use_perm=True, use_had=True, use_phase=True):
                 False,
                 torch.ones(k // 64, device=w.device))
 
-    amax = torch.stack([a.abs().amax(0) for a in acts]).amax(0)
+    # First take a per-channel token maximum inside each calibration sample,
+    # then average those maxima across samples to reduce single-sample outliers.
+    amax = torch.stack([a.abs().amax(dim=0) for a in acts], dim=0).mean(dim=0)
     wmax = w.abs().amax(0)
     smooth = _v31_smooth(amax, wmax, 0.50)
 
