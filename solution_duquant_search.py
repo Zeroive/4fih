@@ -228,6 +228,8 @@ _SCALER_BETAS = (0.0, 0.25, 0.50)
 SCALER_MAX_CALIB_SAMPLES = 4
 SCALER_MAX_TOKENS_PER_SAMPLE = 20
 SCALER_MAX_WEIGHT_ROWS = 48
+ATTN_SCALER_MAX_CALIB_SAMPLES = 4
+ATTN_SCALER_MAX_SEQ_LEN = 128
 
 
 def _v31_scaler(
@@ -354,14 +356,192 @@ def hif4_dynamic_quantize_activation(activation_quant, activation_scale, activat
     return _hif4_direct(_block_rotate(At, r2))
 
 
-# Attention is not changed by this paper-specific Linear ablation.
+def _reshape_attention_heads(
+    x: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    return x.float().reshape(x.shape[0], num_heads, head_dim)
+
+
+def _attention_output(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_num_heads: int,
+    kv_num_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Reference/GQA attention output for one calibration sample."""
+    if q_num_heads % kv_num_heads != 0:
+        raise ValueError("q_num_heads must be divisible by kv_num_heads")
+    repeats = q_num_heads // kv_num_heads
+    k_expanded = k.repeat_interleave(repeats, dim=1)
+    v_expanded = v.repeat_interleave(repeats, dim=1)
+    qh = q.permute(1, 0, 2)
+    kh = k_expanded.permute(1, 2, 0)
+    scores = torch.matmul(qh, kh) / math.sqrt(float(head_dim))
+    probabilities = torch.softmax(scores, dim=-1)
+    vh = v_expanded.permute(1, 0, 2)
+    return torch.matmul(probabilities, vh).permute(1, 0, 2)
+
+
+def _attention_scaler(
+    q_absmax: torch.Tensor,
+    k_absmax: torch.Tensor,
+    beta: float,
+) -> torch.Tensor:
+    """Per-head-channel scaler preserving Q K^T: Q*s and K/s."""
+    if beta <= 0.0:
+        return torch.ones_like(q_absmax)
+    log_scale = float(beta) * (
+        torch.log(k_absmax.clamp_min(2**-24))
+        - torch.log(q_absmax.clamp_min(2**-24))
+    )
+    log_scale -= log_scale.median()
+    return torch.exp(log_scale).clamp_(2**-6, 2**6)
+
+
+def _decode_attention_calibration(
+    calib_qkv_list: list,
+    q_num_heads: int,
+    kv_num_heads: int,
+    head_dim: int,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    samples = []
+    for sample in calib_qkv_list[:ATTN_SCALER_MAX_CALIB_SAMPLES]:
+        if not isinstance(sample, dict) or not all(
+            name in sample for name in ("q", "k", "v")
+        ):
+            continue
+        q_pair, k_pair, v_pair = sample["q"], sample["k"], sample["v"]
+        if not all(
+            isinstance(pair, (list, tuple)) and len(pair) == 2
+            for pair in (q_pair, k_pair, v_pair)
+        ):
+            continue
+        q = _reshape_attention_heads(
+            dequantize_nvfp4(q_pair[0], q_pair[1]), q_num_heads, head_dim
+        )
+        k = _reshape_attention_heads(
+            dequantize_nvfp4(k_pair[0], k_pair[1]), kv_num_heads, head_dim
+        )
+        v = _reshape_attention_heads(
+            dequantize_nvfp4(v_pair[0], v_pair[1]), kv_num_heads, head_dim
+        )
+        seq_len = min(q.shape[0], k.shape[0], v.shape[0])
+        if seq_len <= 0:
+            continue
+        indices = _even_indices(
+            seq_len, min(ATTN_SCALER_MAX_SEQ_LEN, seq_len), q.device
+        )
+        samples.append((q[indices], k[indices], v[indices]))
+    return samples
+
+
+def _search_attention_scaler(
+    samples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    q_num_heads: int,
+    kv_num_heads: int,
+    head_dim: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, float]:
+    if ATTN_SCALER_MAX_CALIB_SAMPLES <= 0 or ATTN_SCALER_MAX_SEQ_LEN <= 0:
+        raise ValueError("attention scaler-search sampling limits must be positive")
+    if not samples:
+        return torch.ones(
+            kv_num_heads, head_dim, dtype=torch.float32, device=device
+        ), 0.0
+
+    if q_num_heads % kv_num_heads != 0:
+        raise ValueError("q_num_heads must be divisible by kv_num_heads")
+    q_per_kv = q_num_heads // kv_num_heads
+
+    q_absmax = torch.stack(
+        [q.abs().amax(dim=0) for q, _, _ in samples]
+    ).amax(dim=0)
+    k_absmax = torch.stack(
+        [k.abs().amax(dim=0) for _, k, _ in samples]
+    ).amax(dim=0)
+    q_group_absmax = q_absmax.reshape(
+        kv_num_heads, q_per_kv, head_dim
+    ).amax(dim=1)
+    scores = {beta: [] for beta in _SCALER_BETAS}
+
+    for q, k, v in samples:
+        reference = _attention_output(
+            q, k, v, q_num_heads, kv_num_heads, head_dim
+        )
+        v_flat = v.reshape(v.shape[0], -1)
+        v_q = _hif4_reconstruct(_hif4_direct(v_flat)).reshape_as(v)
+
+        for beta in _SCALER_BETAS:
+            k_scaler = _attention_scaler(q_group_absmax, k_absmax, beta)
+            q_scaler = k_scaler.repeat_interleave(q_per_kv, dim=0)
+            q_scaled = (q * q_scaler).reshape(q.shape[0], -1)
+            k_scaled = (k / k_scaler).reshape(k.shape[0], -1)
+            q_q = _hif4_reconstruct(_hif4_direct(q_scaled)).reshape_as(q)
+            k_q = _hif4_reconstruct(_hif4_direct(k_scaled)).reshape_as(k)
+            candidate = _attention_output(
+                q_q, k_q, v_q, q_num_heads, kv_num_heads, head_dim
+            )
+            scores[beta].append(
+                float((candidate - reference).square().mean().item())
+            )
+
+    baseline = scores[0.0]
+    best_ratio = 1.0
+    best_beta = 0.0
+    for beta in _SCALER_BETAS[1:]:
+        ratios = [
+            candidate / max(base, 1e-20)
+            for candidate, base in zip(scores[beta], baseline)
+        ]
+        pooled = sum(scores[beta]) / max(sum(baseline), 1e-20)
+        if max(ratios) <= 0.99 and pooled <= 0.92 and pooled < best_ratio:
+            best_ratio = pooled
+            best_beta = beta
+
+    return (
+        _attention_scaler(q_group_absmax, k_absmax, best_beta),
+        float(best_beta),
+    )
+
+
 def hif4_calibration_attention(
     calib_qkv_list: list,
     q_num_heads: int,
     kv_num_heads: int,
     head_dim: int,
 ) -> dict[str, Any]:
-    return {"q_state": None, "k_state": None, "v_state": None}
+    if q_num_heads <= 0 or kv_num_heads <= 0 or head_dim <= 0:
+        raise ValueError("attention head counts and head_dim must be positive")
+    if q_num_heads % kv_num_heads != 0:
+        raise ValueError("q_num_heads must be divisible by kv_num_heads")
+    if ATTN_SCALER_MAX_CALIB_SAMPLES <= 0 or ATTN_SCALER_MAX_SEQ_LEN <= 0:
+        raise ValueError("attention scaler-search sampling limits must be positive")
+    samples = _decode_attention_calibration(
+        calib_qkv_list, q_num_heads, kv_num_heads, head_dim
+    )
+    device = samples[0][0].device if samples else torch.device("cpu")
+    k_scaler, beta = _search_attention_scaler(
+        samples, q_num_heads, kv_num_heads, head_dim, device
+    )
+    q_per_kv = q_num_heads // kv_num_heads
+    q_scaler = k_scaler.repeat_interleave(q_per_kv, dim=0)
+    return {
+        "q_state": {
+            "attention_scaler": q_scaler.detach().cpu(),
+            "scaler_beta": beta,
+            "role": "q",
+        },
+        "k_state": {
+            "attention_scaler": k_scaler.detach().cpu(),
+            "scaler_beta": beta,
+            "role": "k",
+        },
+        "v_state": None,
+    }
 
 
 def hif4_dynamic_quantize_q(
@@ -371,7 +551,11 @@ def hif4_dynamic_quantize_q(
     head_dim: int,
     q_state: Any,
 ) -> dict[str, torch.Tensor]:
-    return _hif4_direct(dequantize_nvfp4(q_quant, q_scale).float())
+    q = _reshape_attention_heads(
+        dequantize_nvfp4(q_quant, q_scale), q_num_heads, head_dim
+    )
+    scaler = q_state["attention_scaler"].to(q.device)
+    return _hif4_direct((q * scaler).reshape(q_quant.shape))
 
 
 def hif4_dynamic_quantize_k(
@@ -381,7 +565,11 @@ def hif4_dynamic_quantize_k(
     head_dim: int,
     k_state: Any,
 ) -> dict[str, torch.Tensor]:
-    return _hif4_direct(dequantize_nvfp4(k_quant, k_scale).float())
+    k = _reshape_attention_heads(
+        dequantize_nvfp4(k_quant, k_scale), kv_num_heads, head_dim
+    )
+    scaler = k_state["attention_scaler"].to(k.device)
+    return _hif4_direct((k / scaler).reshape(k_quant.shape))
 
 
 def hif4_dynamic_quantize_v(
