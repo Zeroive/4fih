@@ -114,14 +114,20 @@ def _hif4_direct(x: torch.Tensor) -> dict[str, torch.Tensor]:
     }
 
 def _activation_absmax_and_samples(calib_activation_list, channels, device):
-    stat = torch.zeros(channels, dtype=torch.float32, device=device)
+    sample_stats = []
     samples = []
     for activation_quant, activation_scale in calib_activation_list:
         A = dequantize_nvfp4(activation_quant, activation_scale).to(
             device=device, dtype=torch.float32
         ).reshape(-1, channels)
-        stat = torch.maximum(stat, A.abs().amax(dim=0))
+        sample_stats.append(A.abs().amax(dim=0))
         samples.append(A)
+    if sample_stats:
+        # Preserve the per-sample outlier statistic, but do not let one
+        # calibration sample determine the channel scale for every sample.
+        stat = torch.stack(sample_stats, dim=0).mean(dim=0)
+    else:
+        stat = torch.zeros(channels, dtype=torch.float32, device=device)
     return stat, samples
 
 
@@ -140,23 +146,28 @@ def _block_rotate(x: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
 
 
 def _worst_local_position(samples: list[torch.Tensor]) -> int:
-    local = None
+    sample_scores = []
     for A in samples:
         score = A.abs().reshape(-1, A.shape[-1] // 64, 64).amax(dim=(0, 1))
-        local = score if local is None else torch.maximum(local, score)
-    return 0 if local is None else int(local.argmax().item())
+        sample_scores.append(score)
+    if not sample_scores:
+        return 0
+    # Each calibration sample contributes its own worst value per local lane;
+    # samples are then weighted equally instead of taking a global maximum.
+    local = torch.stack(sample_scores, dim=0).mean(dim=0)
+    return int(local.argmax().item())
 
 
 DUQUANT_MAX_ROTATION_STEPS = 8
 
 
 def _activation_peak(samples: list[torch.Tensor]) -> float:
-    """Maximum absolute calibration value after the current rotation."""
-    peak = 0.0
+    """Mean of the per-sample absolute peaks after the current rotation."""
+    sample_peaks = []
     for A in samples:
         if A.numel():
-            peak = max(peak, float(A.abs().amax().item()))
-    return peak
+            sample_peaks.append(float(A.abs().amax().item()))
+    return sum(sample_peaks) / len(sample_peaks) if sample_peaks else 0.0
 
 
 def _search_multistep_rotation(
@@ -169,7 +180,7 @@ def _search_multistep_rotation(
     All 64-channel groups share the cumulative rotation, matching the previous
     implementation.  At every step the worst local lane is recomputed on the
     already-rotated calibration activations.  Candidate depths 1..max_steps are
-    compared by their global activation peak.
+    compared by the mean of their per-sample activation peaks.
     """
     identity = torch.eye(64, dtype=torch.float32, device=device)
     if not samples or max_steps <= 0:
@@ -219,9 +230,13 @@ def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activ
 
     r1, r1_steps, r1_peak = _search_multistep_rotation(smoothed, W.device)
     rotated = [_block_rotate(A, r1) for A in smoothed]
-    channel_score = torch.zeros(W.shape[-1], device=W.device)
+    sample_channel_scores = []
     for A in rotated:
-        channel_score = torch.maximum(channel_score, A.abs().amax(dim=0))
+        sample_channel_scores.append(A.abs().amax(dim=0))
+    if sample_channel_scores:
+        channel_score = torch.stack(sample_channel_scores, dim=0).mean(dim=0)
+    else:
+        channel_score = torch.zeros(W.shape[-1], device=W.device)
     perm = _zigzag_permutation(channel_score)
     regrouped = [A.index_select(-1, perm) for A in rotated]
     r2, r2_steps, r2_peak = _search_multistep_rotation(regrouped, W.device)
