@@ -1,11 +1,12 @@
-"""Standalone DuQuant variant with exactly one runtime rotation.
+"""Standalone DuQuant variant with hierarchical 64/8/4 rotations.
 
 Linear path:
 
-    Smooth -> one outlier-aware Householder R1 -> zigzag permutation -> HiF4
+    Smooth -> R64 -> zigzag permutation -> R8 -> R4 -> HiF4
 
 Calibration statistics retain a per-sample maximum and average those maxima
-across samples.  There is no multi-step rotation search and no R2.
+across samples.  Every rotation level uses exactly one shared Householder; there
+is no multi-step rotation search.
 """
 
 from __future__ import annotations
@@ -127,29 +128,44 @@ def _activation_stats_and_samples(
     return activation_stat, samples
 
 
-def _householder64(position: int, device: torch.device) -> torch.Tensor:
-    source = torch.zeros(64, dtype=torch.float32, device=device)
+def _householder(
+    width: int,
+    position: int,
+    device: torch.device,
+) -> torch.Tensor:
+    source = torch.zeros(width, dtype=torch.float32, device=device)
     source[position] = 1.0
-    target = torch.full_like(source, 1.0 / 8.0)
+    target = torch.full_like(source, 1.0 / (width**0.5))
     direction = source - target
-    return torch.eye(64, dtype=torch.float32, device=device) - (
+    return torch.eye(width, dtype=torch.float32, device=device) - (
         2.0
         * torch.outer(direction, direction)
         / direction.dot(direction).clamp_min(EPS)
     )
 
 
-def _block_rotate(x: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
+def _block_rotate(
+    x: torch.Tensor,
+    rotation: torch.Tensor,
+) -> torch.Tensor:
     shape = x.shape
-    grouped = x.float().reshape(*shape[:-1], -1, 64)
+    width = rotation.shape[-1]
+    if shape[-1] % width != 0:
+        raise ValueError(
+            f"last dimension {shape[-1]} is not divisible by rotation width {width}"
+        )
+    grouped = x.float().reshape(*shape[:-1], -1, width)
     return torch.matmul(grouped, rotation).reshape(shape)
 
 
-def _worst_local_position(samples: list[torch.Tensor]) -> int:
+def _worst_local_position(
+    samples: list[torch.Tensor],
+    width: int,
+) -> int:
     sample_lane_maxima = []
     for activation in samples:
         grouped = activation.abs().reshape(
-            -1, activation.shape[-1] // 64, 64
+            -1, activation.shape[-1] // width, width
         )
         sample_lane_maxima.append(grouped.amax(dim=(0, 1)))
     if not sample_lane_maxima:
@@ -186,11 +202,11 @@ def hif4_calibration_and_quantize_weight(
     )
 
     smoothed_samples = [activation / smooth_scale for activation in samples]
-    position = _worst_local_position(smoothed_samples)
-    rotation = _householder64(position, weight.device)
+    position64 = _worst_local_position(smoothed_samples, 64)
+    rotation64 = _householder(64, position64, weight.device)
 
     rotated_samples = [
-        _block_rotate(activation, rotation) for activation in smoothed_samples
+        _block_rotate(activation, rotation64) for activation in smoothed_samples
     ]
     if rotated_samples:
         channel_score = torch.stack(
@@ -203,14 +219,34 @@ def hif4_calibration_and_quantize_weight(
         )
     permutation = _zigzag_permutation(channel_score)
 
+    permuted_samples = [
+        activation.index_select(-1, permutation)
+        for activation in rotated_samples
+    ]
+    position8 = _worst_local_position(permuted_samples, 8)
+    rotation8 = _householder(8, position8, weight.device)
+    rotated8_samples = [
+        _block_rotate(activation, rotation8)
+        for activation in permuted_samples
+    ]
+
+    position4 = _worst_local_position(rotated8_samples, 4)
+    rotation4 = _householder(4, position4, weight.device)
+
     transformed_weight = _block_rotate(
-        weight * smooth_scale, rotation
+        weight * smooth_scale, rotation64
     ).index_select(-1, permutation)
+    transformed_weight = _block_rotate(transformed_weight, rotation8)
+    transformed_weight = _block_rotate(transformed_weight, rotation4)
     state = {
         "smooth_scale": smooth_scale.detach().cpu(),
-        "rotation": rotation.detach().cpu(),
-        "rotation_position": position,
+        "rotation64": rotation64.detach().cpu(),
+        "rotation64_position": position64,
         "perm": permutation.detach().cpu(),
+        "rotation8": rotation8.detach().cpu(),
+        "rotation8_position": position8,
+        "rotation4": rotation4.detach().cpu(),
+        "rotation4_position": position4,
     }
     return {
         "weight_params": _hif4_direct(transformed_weight),
@@ -227,12 +263,16 @@ def hif4_dynamic_quantize_activation(
         activation_quant, activation_scale
     ).float()
     smooth_scale = activation_state["smooth_scale"].to(activation.device)
-    rotation = activation_state["rotation"].to(activation.device)
+    rotation64 = activation_state["rotation64"].to(activation.device)
     permutation = activation_state["perm"].to(activation.device)
+    rotation8 = activation_state["rotation8"].to(activation.device)
+    rotation4 = activation_state["rotation4"].to(activation.device)
 
     transformed = _block_rotate(
-        activation / smooth_scale, rotation
+        activation / smooth_scale, rotation64
     ).index_select(-1, permutation)
+    transformed = _block_rotate(transformed, rotation8)
+    transformed = _block_rotate(transformed, rotation4)
     return _hif4_direct(transformed)
 
 
