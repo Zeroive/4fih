@@ -12,9 +12,10 @@ _HIF4_BLOCK = 64
 _NVFP4_BLOCK = 16
 _SEARCH_CHUNK_BLOCKS = 16384
 _E6_ANCHOR_OFFSETS = (-1, 0, 1, 2, 3, 4)
-_K_QUOTIENT_TOTAL_ROUNDS = 8
-_K_RELAX_GAMMAS = (1.0, 1.5, 2.0, 2.5)
-_K_MEDIAN_EXTRA_ROUNDS = 3
+# Latency-bounded K quotient: 6 candidates instead of the previous 42.
+_K_QUOTIENT_TOTAL_ROUNDS = 2
+_K_RELAX_GAMMAS = (1.0, 2.0)
+_K_MEDIAN_EXTRA_ROUNDS = 1
 _ATTN_HEAD_ROTATION_CANDIDATES = (-1, 0, 1)  # identity, H64, signed H64
 _ATTN_TAIL_PERCENT = 0.01
 _ATTN_TAIL_HESSIAN_WEIGHT = 0.50
@@ -413,10 +414,18 @@ def _apply_per_head_rotation(
     y = _attention_head_view(x, num_heads, head_dim)
     if not isinstance(patterns, torch.Tensor) or patterns.numel() != num_heads:
         return y
-    patterns = patterns.reshape(num_heads).to(device=y.device, dtype=torch.int64)
+    # Group heads by the three possible patterns. This avoids one CUDA launch and
+    # one synchronising Tensor.item() call per head.
+    patterns_cpu = patterns.reshape(num_heads).to(device="cpu", dtype=torch.int64)
     out = torch.empty_like(y)
-    for head in range(num_heads):
-        out[..., head, :] = _v35_rotate64(y[..., head, :], int(patterns[head].item()))
+    for pattern in _ATTN_HEAD_ROTATION_CANDIDATES:
+        index_cpu = torch.nonzero(patterns_cpu == pattern, as_tuple=False).flatten()
+        if int(index_cpu.numel()) == 0:
+            continue
+        index = index_cpu.to(y.device)
+        selected = y.index_select(-2, index)
+        transformed = _v35_rotate64(selected, int(pattern))
+        out.index_copy_(-2, index, transformed)
     return out
 
 
@@ -471,22 +480,25 @@ def _quantize_attention_hessian_per_head(
             x, num_heads, head_dim, return_dequant=False
         )[0]
 
-    prefix = shape[:-1]
-    per_head = []
-    for head in range(num_heads):
-        params, _ = _v37_quantize_hessian(
-            xh[..., head, :],
-            hessian_per_head[head].to(x.device, dtype=torch.float32),
-            return_dequant=False,
-        )
-        per_head.append(params)
+    # Public attention tensors are [sequence, heads * head_dim]. Head-major layout
+    # lets all heads share one batched scale-search invocation.
+    prefix = shape[:-2]
+    x_head_major = xh.transpose(-3, -2)
+    hdiag = hessian_per_head.to(x.device, dtype=torch.float32)
+    params, _ = _v37_quantize_hessian(
+        x_head_major, hdiag, return_dequant=False
+    )
 
+    head_axis = len(prefix)
     out = {}
-    for name in per_head[0]:
-        value = torch.stack([p[name] for p in per_head], dim=len(prefix))
-        tail = tuple(int(v) for v in value.shape[len(prefix) + 2:])
+    for name, value in params.items():
+        value = value.movedim(head_axis, head_axis + 1)
+        tail = tuple(int(v) for v in value.shape[len(prefix) + 3:])
         out[name] = value.reshape(
-            *prefix, num_heads * (head_dim // _HIF4_BLOCK), *tail
+            *prefix,
+            shape[-2],
+            num_heads * (head_dim // _HIF4_BLOCK),
+            *tail,
         )
     return out
 
