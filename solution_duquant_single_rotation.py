@@ -2,7 +2,7 @@
 
 Linear path:
 
-    Smooth -> R64 -> zigzag permutation -> R8 -> R4 -> HiF4
+    Smooth -> R64 -> global perm8 -> R8 -> global perm4 -> R4 -> HiF4
 
 Calibration statistics retain a per-sample maximum and average those maxima
 across samples.  Every rotation level uses exactly one shared Householder; there
@@ -174,10 +174,25 @@ def _worst_local_position(
     return int(lane_score.argmax().item())
 
 
-def _zigzag_permutation(score: torch.Tensor) -> torch.Tensor:
+def _zigzag_permutation(
+    score: torch.Tensor,
+    group_width: int,
+) -> torch.Tensor:
+    """Globally redistribute channels into groups of ``group_width``.
+
+    This is not restricted to the preceding rotation groups.  For example,
+    perm8 may move outputs originating from different R64 groups into the same
+    new 8-element group.
+    """
+    if score.numel() % group_width != 0:
+        raise ValueError(
+            f"channel count {score.numel()} is not divisible by {group_width}"
+        )
     order = torch.argsort(score, descending=True)
-    groups = order.numel() // 64
-    table = torch.empty(groups, 64, dtype=order.dtype, device=order.device)
+    groups = order.numel() // group_width
+    table = torch.empty(
+        groups, group_width, dtype=order.dtype, device=order.device
+    )
     for rank in range(order.numel()):
         lane = rank // groups
         offset = rank % groups
@@ -217,10 +232,10 @@ def hif4_calibration_and_quantize_weight(
         channel_score = torch.zeros(
             weight.shape[-1], dtype=torch.float32, device=weight.device
         )
-    permutation = _zigzag_permutation(channel_score)
+    permutation8 = _zigzag_permutation(channel_score, group_width=8)
 
     permuted_samples = [
-        activation.index_select(-1, permutation)
+        activation.index_select(-1, permutation8)
         for activation in rotated_samples
     ]
     position8 = _worst_local_position(permuted_samples, 8)
@@ -230,21 +245,38 @@ def hif4_calibration_and_quantize_weight(
         for activation in permuted_samples
     ]
 
-    position4 = _worst_local_position(rotated8_samples, 4)
+    if rotated8_samples:
+        channel_score4 = torch.stack(
+            [activation.abs().amax(dim=0) for activation in rotated8_samples],
+            dim=0,
+        ).mean(dim=0)
+    else:
+        channel_score4 = torch.zeros(
+            weight.shape[-1], dtype=torch.float32, device=weight.device
+        )
+    permutation4 = _zigzag_permutation(channel_score4, group_width=4)
+    permuted4_samples = [
+        activation.index_select(-1, permutation4)
+        for activation in rotated8_samples
+    ]
+
+    position4 = _worst_local_position(permuted4_samples, 4)
     rotation4 = _householder(4, position4, weight.device)
 
     transformed_weight = _block_rotate(
         weight * smooth_scale, rotation64
-    ).index_select(-1, permutation)
+    ).index_select(-1, permutation8)
     transformed_weight = _block_rotate(transformed_weight, rotation8)
+    transformed_weight = transformed_weight.index_select(-1, permutation4)
     transformed_weight = _block_rotate(transformed_weight, rotation4)
     state = {
         "smooth_scale": smooth_scale.detach().cpu(),
         "rotation64": rotation64.detach().cpu(),
         "rotation64_position": position64,
-        "perm": permutation.detach().cpu(),
+        "perm8": permutation8.detach().cpu(),
         "rotation8": rotation8.detach().cpu(),
         "rotation8_position": position8,
+        "perm4": permutation4.detach().cpu(),
         "rotation4": rotation4.detach().cpu(),
         "rotation4_position": position4,
     }
@@ -264,14 +296,16 @@ def hif4_dynamic_quantize_activation(
     ).float()
     smooth_scale = activation_state["smooth_scale"].to(activation.device)
     rotation64 = activation_state["rotation64"].to(activation.device)
-    permutation = activation_state["perm"].to(activation.device)
+    permutation8 = activation_state["perm8"].to(activation.device)
     rotation8 = activation_state["rotation8"].to(activation.device)
+    permutation4 = activation_state["perm4"].to(activation.device)
     rotation4 = activation_state["rotation4"].to(activation.device)
 
     transformed = _block_rotate(
         activation / smooth_scale, rotation64
-    ).index_select(-1, permutation)
+    ).index_select(-1, permutation8)
     transformed = _block_rotate(transformed, rotation8)
+    transformed = transformed.index_select(-1, permutation4)
     transformed = _block_rotate(transformed, rotation4)
     return _hif4_direct(transformed)
 
