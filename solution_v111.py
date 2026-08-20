@@ -17,9 +17,6 @@ _K_QUOTIENT_TOTAL_ROUNDS = 2
 _K_RELAX_GAMMAS = (1.0, 2.0)
 _K_MEDIAN_EXTRA_ROUNDS = 1
 _ATTN_HEAD_ROTATION_CANDIDATES = (-1, 0, 1)  # identity, H64, signed H64
-_ATTN_TAIL_PERCENT = 0.01
-_ATTN_TAIL_HESSIAN_WEIGHT = 0.50
-_ATTN_HESSIAN_DAMPING = 1.0e-4
 
 _E6_TABLE_CACHE: dict[str, torch.Tensor] = {}
 
@@ -197,7 +194,6 @@ def _merge_k_candidates_per_feature_block(
         x: torch.Tensor,
         params_list: list[dict],
         dq_list: list[torch.Tensor],
-        hblocks: Optional[torch.Tensor] = None,
 ) -> dict:
     if len(params_list) == 1 or x.dim() < 2 or int(x.shape[-2]) <= 1:
         return params_list[0]
@@ -214,14 +210,7 @@ def _merge_k_candidates_per_feature_block(
     for dq in dq_list:
         e = dq.float().reshape(groups, seq, nblocks, 64) - x4
         e = e - e.mean(dim=1, keepdim=True)
-        if (isinstance(hblocks, torch.Tensor)
-                and tuple(hblocks.shape) == (groups, nblocks, 64)):
-            # Per-leading-group diagonal Hessian: [group, block, 64].
-            scores.append((e.square() * hblocks[:, None]).sum(dim=(1, 3)))
-        elif isinstance(hblocks, torch.Tensor):
-            scores.append(torch.einsum("gsbi,bij,gsbj->gb", e, hblocks, e))
-        else:
-            scores.append(e.square().sum(dim=(1, 3)))
+        scores.append(e.square().sum(dim=(1, 3)))
     score_stack = torch.stack(scores, dim=0)
     best = score_stack.argmin(dim=0)
 
@@ -241,7 +230,6 @@ def _merge_k_candidates_per_feature_block(
 def _select_best_k_dq_per_feature_block(
         x: torch.Tensor,
         dq_list: list[torch.Tensor],
-        hblocks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if len(dq_list) == 1 or x.dim() < 2 or int(x.shape[-2]) <= 1:
         return dq_list[0]
@@ -258,13 +246,7 @@ def _select_best_k_dq_per_feature_block(
         q4 = dq.float().reshape(groups, seq, nblocks, 64)
         e = q4 - x4
         e = e - e.mean(dim=1, keepdim=True)
-        if (isinstance(hblocks, torch.Tensor)
-                and tuple(hblocks.shape) == (groups, nblocks, 64)):
-            scores.append((e.square() * hblocks[:, None]).sum(dim=(1, 3)))
-        elif isinstance(hblocks, torch.Tensor):
-            scores.append(torch.einsum("gsbi,bij,gsbj->gb", e, hblocks, e))
-        else:
-            scores.append(e.square().sum(dim=(1, 3)))
+        scores.append(e.square().sum(dim=(1, 3)))
         qs.append(q4)
     best = torch.stack(scores, dim=0).argmin(dim=0)
     out = qs[0].clone()
@@ -274,10 +256,7 @@ def _select_best_k_dq_per_feature_block(
     return out.reshape(shape)
 
 
-def _quantize_k_softmax_quotient_tensor(
-        x: torch.Tensor,
-        hblocks: Optional[torch.Tensor] = None,
-) -> dict:
+def _quantize_k_softmax_quotient_tensor(x: torch.Tensor) -> dict:
     """Search the softmax-invariant K quotient in each leading group separately."""
     x = x.float()
     if x.dim() < 2 or int(x.shape[-2]) <= 1:
@@ -286,13 +265,7 @@ def _quantize_k_softmax_quotient_tensor(
     params_list: list[dict] = []
     dq_list: list[torch.Tensor] = []
 
-    quantize = (
-        (lambda z: _v37_quantize_hessian(z, hblocks, return_dequant=True))
-        if isinstance(hblocks, torch.Tensor)
-        else (lambda z: _quantize_tensor_self_mse(z, return_dequant=True))
-    )
-
-    p, q = quantize(x)
+    p, q = _quantize_tensor_self_mse(x, return_dequant=True)
     params_list.append(p)
     dq_list.append(q)
 
@@ -305,30 +278,30 @@ def _quantize_k_softmax_quotient_tensor(
         for gamma in _K_RELAX_GAMMAS:
             c_try = c_prev + float(gamma) * delta
             target = x - c_try
-            p, q = quantize(target)
+            p, q = _quantize_tensor_self_mse(target, return_dequant=True)
             params_list.append(p)
             dq_list.append(q)
-        q_best = _select_best_k_dq_per_feature_block(x, dq_list, hblocks)
+        q_best = _select_best_k_dq_per_feature_block(x, dq_list)
         c_prev = c_star
 
     c_prev = x.median(dim=-2, keepdim=True).values
-    p, q = quantize(x - c_prev)
+    p, q = _quantize_tensor_self_mse(x - c_prev, return_dequant=True)
     params_list.append(p)
     dq_list.append(q)
-    q_best = _select_best_k_dq_per_feature_block(x, dq_list, hblocks)
+    q_best = _select_best_k_dq_per_feature_block(x, dq_list)
 
     for _ in range(_K_MEDIAN_EXTRA_ROUNDS):
         c_star = (x - q_best).mean(dim=-2, keepdim=True)
         delta = c_star - c_prev
         for gamma in _K_RELAX_GAMMAS:
             c_try = c_prev + float(gamma) * delta
-            p, q = quantize(x - c_try)
+            p, q = _quantize_tensor_self_mse(x - c_try, return_dequant=True)
             params_list.append(p)
             dq_list.append(q)
-        q_best = _select_best_k_dq_per_feature_block(x, dq_list, hblocks)
+        q_best = _select_best_k_dq_per_feature_block(x, dq_list)
         c_prev = c_star
 
-    return _merge_k_candidates_per_feature_block(x, params_list, dq_list, hblocks)
+    return _merge_k_candidates_per_feature_block(x, params_list, dq_list)
 
 
 def _quantize_k_softmax_quotient(k_quant: torch.Tensor, k_scale: torch.Tensor) -> dict:
@@ -462,68 +435,19 @@ def _quantize_attention_per_head(
     return params, dq
 
 
-def _quantize_attention_hessian_per_head(
-        x: torch.Tensor,
-        num_heads: int,
-        head_dim: int,
-        hessian_per_head,
-) -> dict:
-    """Use a different block-diagonal Hessian for every attention head."""
-    shape = tuple(int(v) for v in x.shape)
-    xh = _attention_head_view(x, num_heads, head_dim)
-    if (
-            not isinstance(hessian_per_head, torch.Tensor)
-            or tuple(hessian_per_head.shape)
-            != (num_heads, head_dim // _HIF4_BLOCK, _HIF4_BLOCK)
-    ):
-        return _quantize_attention_per_head(
-            x, num_heads, head_dim, return_dequant=False
-        )[0]
-
-    # Public attention tensors are [sequence, heads * head_dim]. Head-major layout
-    # lets all heads share one batched scale-search invocation.
-    prefix = shape[:-2]
-    x_head_major = xh.transpose(-3, -2)
-    hdiag = hessian_per_head.to(x.device, dtype=torch.float32)
-    params, _ = _v37_quantize_hessian(
-        x_head_major, hdiag, return_dequant=False
-    )
-
-    head_axis = len(prefix)
-    out = {}
-    for name, value in params.items():
-        value = value.movedim(head_axis, head_axis + 1)
-        tail = tuple(int(v) for v in value.shape[len(prefix) + 3:])
-        out[name] = value.reshape(
-            *prefix,
-            shape[-2],
-            num_heads * (head_dim // _HIF4_BLOCK),
-            *tail,
-        )
-    return out
-
-
 def _quantize_k_per_head(
         x: torch.Tensor,
         num_heads: int,
         head_dim: int,
-        hessian_per_head=None,
 ) -> dict:
-    """Run quotient and optional Hessian search independently for every K head."""
+    """Run quotient search independently for every K head."""
     shape = tuple(int(v) for v in x.shape)
     xh = _attention_head_view(x, num_heads, head_dim)
     batch_prefix = shape[:-2]
     # The public interface is 2-D. Head-major layout makes every head a leading
     # group while evaluating all heads in the same quotient-search kernels.
     x_head_major = xh.transpose(-3, -2)
-    hdiag = None
-    if (
-            isinstance(hessian_per_head, torch.Tensor)
-            and tuple(hessian_per_head.shape)
-            == (num_heads, head_dim // _HIF4_BLOCK, _HIF4_BLOCK)
-    ):
-        hdiag = hessian_per_head.to(x.device, dtype=torch.float32)
-    params = _quantize_k_softmax_quotient_tensor(x_head_major, hblocks=hdiag)
+    params = _quantize_k_softmax_quotient_tensor(x_head_major)
 
     head_axis = len(batch_prefix)
     out = {}
@@ -537,38 +461,6 @@ def _quantize_k_per_head(
             *tail,
         )
     return out
-
-
-def _update_top_norm_rows(
-        current: Optional[torch.Tensor],
-        rows: torch.Tensor,
-        keep: int,
-) -> torch.Tensor:
-    """Keep the globally largest-norm calibration rows without retaining all tokens."""
-    rows = rows.detach()
-    pool = rows if current is None else torch.cat((current, rows), dim=0)
-    if int(pool.shape[0]) <= keep:
-        return pool
-    index = pool.square().sum(dim=-1).topk(keep, largest=True, sorted=False).indices
-    return pool.index_select(0, index)
-
-
-def _tail_aware_hessian_diag_blocks(
-        square_sum: torch.Tensor,
-        count: int,
-        tail_rows: torch.Tensor,
-) -> torch.Tensor:
-    """Build the diagonal of 0.5 H_mean + 0.5 H_tail in linear time."""
-    mean_h = square_sum / max(int(count), 1)
-    tail_h = tail_rows.square().mean(dim=0)
-    rho = float(_ATTN_TAIL_HESSIAN_WEIGHT)
-    h = (1.0 - rho) * mean_h + rho * tail_h
-
-    # Mean normalisation preserves the minimiser and makes damping head-independent.
-    diag_mean = h.mean().clamp_min(2.0 ** -40)
-    h = h / diag_mean
-    h = h + float(_ATTN_HESSIAN_DAMPING)
-    return h.reshape(-1, _HIF4_BLOCK)
 
 
 def _v42_apply_head_matrix(x: torch.Tensor, num_heads: int, head_dim: int,
@@ -610,27 +502,10 @@ def _v64_dequant_params(params, shape):
 def _v37_quantize_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, return_dequant=False):
     shape = tuple(int(s) for s in x.shape)
     c = shape[-1]
-    nb = c // 64 if c % 64 == 0 else 0
-    full_hessian = (
-        isinstance(hblocks, torch.Tensor)
-        and hblocks.dim() == 3
-        and tuple(hblocks.shape) == (nb, 64, 64)
-    )
-    diagonal_hessian = (
-        isinstance(hblocks, torch.Tensor)
-        and hblocks.dim() == 2
-        and tuple(hblocks.shape) == (nb, 64)
-    )
-    grouped_diagonal_hessian = (
-        isinstance(hblocks, torch.Tensor)
-        and hblocks.dim() == 3
-        and tuple(hblocks.shape[1:]) == (nb, 64)
-        and x.dim() >= 2
-        and int(hblocks.shape[0]) == int(x.shape[0])
-    )
-    if c % 64 != 0 or not (full_hessian or diagonal_hessian or grouped_diagonal_hessian):
+    if c % 64 != 0 or hblocks.dim() != 3 or tuple(hblocks.shape[1:]) != (64, 64) or hblocks.shape[0] != c // 64:
         return _quantize_tensor_self_mse(x, return_dequant=return_dequant)
     x = x.float()
+    nb = c // 64
     rows = x.numel() // c
     blocks = x.reshape(rows, nb, 8, 2, 4)
     table = _build_e6m2_table(x.device)
@@ -642,7 +517,6 @@ def _v37_quantize_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, return_dequ
     ma_out = torch.empty((rows, nb, 8, 2, 4), dtype=torch.bfloat16, device=x.device)
     dq_out = torch.empty_like(blocks) if return_dequant else None
     H = hblocks.to(x.device, torch.float32)
-    rows_per_group = rows // int(x.shape[0]) if grouped_diagonal_hessian else 0
     chunk_rows = max(1, 4096 // max(nb, 1))
     for rs in range(0, rows, chunk_rows):
         re = min(rows, rs + chunk_rows)
@@ -658,17 +532,7 @@ def _v37_quantize_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, return_dequ
             sg, ma, l2, l3 = _materialize_fixed_scale_self(z, sf)
             q = (sg * ma * l2 * l3 * sf).reshape(nr, nb, 64)
             e = q - z.reshape(nr, nb, 64)
-            if grouped_diagonal_hessian:
-                group_index = torch.div(
-                    torch.arange(rs, re, device=x.device),
-                    rows_per_group,
-                    rounding_mode='floor',
-                )
-                err = (e.square() * H.index_select(0, group_index)).sum(dim=-1)
-            elif diagonal_hessian:
-                err = (e.square() * H.unsqueeze(0)).sum(dim=-1)
-            else:
-                err = torch.einsum('rbi,bij,rbj->rb', e, H, e)
+            err = torch.einsum('rbi,bij,rbj->rb', e, H, e)
             better = err < best
             if best_pack is None:
                 best = err
@@ -1008,14 +872,6 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
 
     q_per_kv = q_num_heads // kv_num_heads
     first_device = calib_qkv_list[0]["q"][0].device
-    q_amax = torch.zeros((q_num_heads, head_dim), device=first_device)
-    k_amax = torch.zeros((kv_num_heads, head_dim), device=first_device)
-    v_amax = torch.zeros((kv_num_heads, head_dim), device=first_device)
-    q_sumsq = torch.zeros_like(q_amax)
-    k_sumsq = torch.zeros_like(k_amax)
-    v_sumsq = torch.zeros_like(v_amax)
-    q_count = k_count = v_count = 0
-
     nc = len(_ATTN_HEAD_ROTATION_CANDIDATES)
     qk_error = torch.zeros((kv_num_heads, nc, 2), device=first_device)
     qk_energy = torch.zeros((kv_num_heads, nc, 2), device=first_device)
@@ -1023,23 +879,11 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
     for sample in calib_qkv_list:
         q = dequantize_nvfp4(*sample["q"]).float().to(first_device)
         k = dequantize_nvfp4(*sample["k"]).float().to(first_device)
-        v = dequantize_nvfp4(*sample["v"]).float().to(first_device)
         qh = _attention_head_view(q, q_num_heads, head_dim)
         kh = _attention_head_view(k, kv_num_heads, head_dim)
-        vh = _attention_head_view(v, kv_num_heads, head_dim)
 
         q_flat = qh.reshape(-1, q_num_heads, head_dim)
         k_flat = kh.reshape(-1, kv_num_heads, head_dim)
-        v_flat = vh.reshape(-1, kv_num_heads, head_dim)
-        q_amax = torch.maximum(q_amax, q_flat.abs().amax(dim=0))
-        k_amax = torch.maximum(k_amax, k_flat.abs().amax(dim=0))
-        v_amax = torch.maximum(v_amax, v_flat.abs().amax(dim=0))
-        q_sumsq += q_flat.square().sum(dim=0)
-        k_sumsq += k_flat.square().sum(dim=0)
-        v_sumsq += v_flat.square().sum(dim=0)
-        q_count += int(q_flat.shape[0])
-        k_count += int(k_flat.shape[0])
-        v_count += int(v_flat.shape[0])
 
         for kv_head in range(kv_num_heads):
             q_begin = kv_head * q_per_kv
@@ -1067,66 +911,6 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
     k_patterns = candidate_tensor[best]
     q_patterns = k_patterns.repeat_interleave(q_per_kv)
 
-    # Build tail-aware covariance in the selected, QK-equivalent rotated basis.
-    # Only the largest-norm 1% rows per head are retained for the tail component.
-    q_square_sum = torch.zeros((q_num_heads, head_dim), device=first_device)
-    k_square_sum = torch.zeros((kv_num_heads, head_dim), device=first_device)
-    q_tail_keep = max(1, int(math.ceil(q_count * _ATTN_TAIL_PERCENT)))
-    k_tail_keep = max(1, int(math.ceil(k_count * _ATTN_TAIL_PERCENT)))
-    q_tail_rows: list[Optional[torch.Tensor]] = [None] * q_num_heads
-    k_tail_rows: list[Optional[torch.Tensor]] = [None] * kv_num_heads
-
-    for sample in calib_qkv_list:
-        q = dequantize_nvfp4(*sample["q"]).float().to(first_device)
-        k = dequantize_nvfp4(*sample["k"]).float().to(first_device)
-        qt = _apply_per_head_rotation(
-            q, q_num_heads, head_dim, q_patterns
-        ).reshape(-1, q_num_heads, head_dim)
-        kt = _apply_per_head_rotation(
-            k, kv_num_heads, head_dim, k_patterns
-        ).reshape(-1, kv_num_heads, head_dim)
-        q_square_sum += qt.square().sum(dim=0)
-        k_square_sum += kt.square().sum(dim=0)
-        for head in range(q_num_heads):
-            q_tail_rows[head] = _update_top_norm_rows(
-                q_tail_rows[head], qt[:, head, :], q_tail_keep
-            )
-        for head in range(kv_num_heads):
-            k_tail_rows[head] = _update_top_norm_rows(
-                k_tail_rows[head], kt[:, head, :], k_tail_keep
-            )
-
-    k_source_hessian = [
-        _tail_aware_hessian_diag_blocks(
-            k_square_sum[head], k_count, k_tail_rows[head]
-        )
-        for head in range(kv_num_heads)
-    ]
-
-    # Cross-Hessian: Q error is weighted by K statistics; K error is weighted by
-    # all Q heads that share that KV head under grouped-query attention.
-    q_cross_hessian = torch.stack(
-        [k_source_hessian[head // q_per_kv] for head in range(q_num_heads)], dim=0
-    )
-    k_cross_hessian = torch.stack(
-        [
-            _tail_aware_hessian_diag_blocks(
-                q_square_sum[
-                    kv_head * q_per_kv:(kv_head + 1) * q_per_kv
-                ].sum(dim=0),
-                q_count * q_per_kv,
-                torch.cat(
-                    q_tail_rows[
-                        kv_head * q_per_kv:(kv_head + 1) * q_per_kv
-                    ],
-                    dim=0,
-                ),
-            )
-            for kv_head in range(kv_num_heads)
-        ],
-        dim=0,
-    )
-
     common = {"version": _V111_ATTN_HEAD_VERSION, "head_dim": int(head_dim)}
     return {
         "q_state": {
@@ -1134,25 +918,17 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
             "role": "q",
             "num_heads": int(q_num_heads),
             "rotation_per_head": q_patterns.cpu(),
-            "cross_tail_hessian_diag_blocks": q_cross_hessian.cpu(),
-            "amax_per_head_channel": q_amax.cpu(),
-            "second_moment_per_head_channel": (q_sumsq / max(q_count, 1)).cpu(),
         },
         "k_state": {
             **common,
             "role": "k",
             "num_heads": int(kv_num_heads),
             "rotation_per_head": k_patterns.cpu(),
-            "cross_tail_hessian_diag_blocks": k_cross_hessian.cpu(),
-            "amax_per_head_channel": k_amax.cpu(),
-            "second_moment_per_head_channel": (k_sumsq / max(k_count, 1)).cpu(),
         },
         "v_state": {
             **common,
             "role": "v",
             "num_heads": int(kv_num_heads),
-            "amax_per_head_channel": v_amax.cpu(),
-            "second_moment_per_head_channel": (v_sumsq / max(v_count, 1)).cpu(),
         },
     }
 
@@ -1163,12 +939,9 @@ def hif4_dynamic_quantize_q(q_quant, q_scale, q_num_heads, head_dim, q_state):
         qh = _apply_per_head_rotation(
             q, q_num_heads, head_dim, q_state.get("rotation_per_head")
         )
-        return _quantize_attention_hessian_per_head(
-            qh.reshape_as(q),
-            q_num_heads,
-            head_dim,
-            q_state.get("cross_tail_hessian_diag_blocks"),
-        )
+        return _quantize_attention_per_head(
+            qh.reshape_as(q), q_num_heads, head_dim, return_dequant=False
+        )[0]
 
     if isinstance(q_state, dict) and q_state.get("version") == _V42_VERSION:
         q = dequantize_nvfp4(q_quant, q_scale).float()
@@ -1197,12 +970,7 @@ def hif4_dynamic_quantize_k(k_quant, k_scale, kv_num_heads, head_dim, k_state):
             k, kv_num_heads, head_dim, k_state.get("rotation_per_head")
         )
         k = kh.reshape_as(k)
-        return _quantize_k_per_head(
-            k,
-            kv_num_heads,
-            head_dim,
-            k_state.get("cross_tail_hessian_diag_blocks"),
-        )
+        return _quantize_k_per_head(k, kv_num_heads, head_dim)
     return _quantize_k_per_head(k, kv_num_heads, head_dim)
 
 
