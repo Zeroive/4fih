@@ -12,6 +12,10 @@ _HIF4_BLOCK = 64
 _NVFP4_BLOCK = 16
 _SEARCH_CHUNK_BLOCKS = 16384
 _E6_ANCHOR_OFFSETS = (-1, 0, 1, 2, 3, 4)
+# Per-64-block alternating least-squares refinement.  Each round derives the
+# continuous optimum from the block's current HiF4 codes, projects it back to
+# E6M2, requantizes lv2/lv3/mantissa, and keeps it only when the objective drops.
+_LSQ_SCALE_ITERS = 3
 # Latency-bounded K quotient: 6 candidates instead of the previous 42.
 _K_QUOTIENT_TOTAL_ROUNDS = 2
 _K_RELAX_GAMMAS = (1.0, 2.0)
@@ -115,6 +119,45 @@ def _materialize_fixed_scale_self(
     return sign, mant, l2, l3
 
 
+def _least_squares_scale_self(
+        x: torch.Tensor,
+        sign: torch.Tensor,
+        mant: torch.Tensor,
+        l2: torch.Tensor,
+        l3: torch.Tensor,
+) -> torch.Tensor:
+    """Continuous MSE-optimal base scale for fixed per-element HiF4 codes."""
+    code = sign * mant * l2 * l3
+    numerator = (x * code).sum(dim=(-1, -2, -3), keepdim=True)
+    denominator = code.square().sum(dim=(-1, -2, -3), keepdim=True)
+    return torch.where(
+        denominator > 0.0,
+        numerator / denominator.clamp_min(2.0 ** -48),
+        torch.zeros_like(numerator),
+    ).clamp_min(2.0 ** -48)
+
+
+def _least_squares_scale_hessian(
+        x: torch.Tensor,
+        sign: torch.Tensor,
+        mant: torch.Tensor,
+        l2: torch.Tensor,
+        l3: torch.Tensor,
+        hessian: torch.Tensor,
+) -> torch.Tensor:
+    """Hessian-weighted continuous optimum for fixed per-element HiF4 codes."""
+    code = (sign * mant * l2 * l3).reshape(*x.shape[:2], 64)
+    target = x.reshape(*x.shape[:2], 64)
+    numerator = torch.einsum('rbi,bij,rbj->rb', code, hessian, target)
+    denominator = torch.einsum('rbi,bij,rbj->rb', code, hessian, code)
+    scale = torch.where(
+        denominator > 0.0,
+        numerator / denominator.clamp_min(2.0 ** -48),
+        torch.zeros_like(numerator),
+    )
+    return scale.clamp_min(2.0 ** -48).view(*x.shape[:2], 1, 1, 1)
+
+
 def _quantize_tensor_self_mse(
         x: torch.Tensor,
         *,
@@ -164,6 +207,27 @@ def _quantize_tensor_self_mse(
 
         sf = table[best_idx].view(bsz, 1, 1, 1)
         sign, mant, l2, l3 = _materialize_fixed_scale_self(xb, sf)
+
+        # Alternate between the discrete HiF4 codes and their exact continuous
+        # least-squares scale.  E6M2 projection preserves the output contract;
+        # retaining only strict improvements prevents refinement regressions.
+        for _ in range(_LSQ_SCALE_ITERS):
+            sf_ls = _least_squares_scale_self(xb, sign, mant, l2, l3)
+            idx = _nearest_e6m2_index(sf_ls.reshape(-1), table)
+            sf_try = table[idx].view(bsz, 1, 1, 1)
+            sign_try, mant_try, l2_try, l3_try = _materialize_fixed_scale_self(
+                xb, sf_try
+            )
+            dq_try = sign_try * mant_try * l2_try * l3_try * sf_try
+            err_try = (dq_try - xb).square().sum(dim=(-1, -2, -3))
+            better = err_try < best_err
+            mask = better.view(bsz, 1, 1, 1)
+            best_err = torch.where(better, err_try, best_err)
+            sf = torch.where(mask, sf_try, sf)
+            sign = torch.where(mask, sign_try, sign)
+            mant = torch.where(mask, mant_try, mant)
+            l2 = torch.where(mask, l2_try, l2)
+            l3 = torch.where(mask, l3_try, l3)
 
         sf_out[start:end] = sf.to(torch.bfloat16)
         l2_out[start:end] = l2.to(torch.bfloat16)
@@ -545,6 +609,30 @@ def _v37_quantize_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, return_dequ
                     mask = better.view(nr, nb, *([1] * (v.dim() - 2)))
                     best_pack[jj] = torch.where(mask, v, best_pack[jj])
                 best_q = torch.where(better[:, :, None], q, best_q)
+
+        # The Linear weight/activation paths use a Hessian-weighted objective,
+        # so refine their base scales with the corresponding generalized
+        # least-squares closed form rather than unweighted elementwise MSE.
+        for _ in range(_LSQ_SCALE_ITERS):
+            sf, l2, l3, sg, ma = best_pack
+            sf_ls = _least_squares_scale_hessian(z, sg, ma, l2, l3, H)
+            idx = _nearest_e6m2_index(sf_ls.reshape(-1), table)
+            sf_try = table[idx].view(nr, nb, 1, 1, 1)
+            sg_try, ma_try, l2_try, l3_try = _materialize_fixed_scale_self(
+                z, sf_try
+            )
+            q_try = (sg_try * ma_try * l2_try * l3_try * sf_try).reshape(
+                nr, nb, 64
+            )
+            e_try = q_try - z.reshape(nr, nb, 64)
+            err_try = torch.einsum('rbi,bij,rbj->rb', e_try, H, e_try)
+            better = err_try < best
+            best = torch.where(better, err_try, best)
+            vals = (sf_try, l2_try, l3_try, sg_try, ma_try)
+            for jj, v in enumerate(vals):
+                mask = better.view(nr, nb, *([1] * (v.dim() - 2)))
+                best_pack[jj] = torch.where(mask, v, best_pack[jj])
+            best_q = torch.where(better[:, :, None], q_try, best_q)
         sf, l2, l3, sg, ma = best_pack
         sf_out[rs:re] = sf.to(torch.bfloat16)
         l2_out[rs:re] = l2.to(torch.bfloat16)
