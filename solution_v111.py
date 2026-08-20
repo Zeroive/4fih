@@ -16,6 +16,7 @@ _E6_ANCHOR_OFFSETS = (-1, 0, 1, 2, 3, 4)
 # continuous optimum from the block's current HiF4 codes, projects it back to
 # E6M2, requantizes lv2/lv3/mantissa, and keeps it only when the objective drops.
 _LSQ_SCALE_ITERS = 3
+_LSQ_PRINT_SELECTION = True
 # Latency-bounded K quotient: 6 candidates instead of the previous 42.
 _K_QUOTIENT_TOTAL_ROUNDS = 2
 _K_RELAX_GAMMAS = (1.0, 2.0)
@@ -162,6 +163,7 @@ def _quantize_tensor_self_mse(
         x: torch.Tensor,
         *,
         return_dequant: bool = False,
+        lsq_debug_label: Optional[str] = None,
 ) -> Tuple[dict, Optional[torch.Tensor]]:
     shape = tuple(int(s) for s in x.shape)
     if not shape:
@@ -185,6 +187,9 @@ def _quantize_tensor_self_mse(
     sign_out = torch.empty((total, 8, 2, 4), dtype=torch.bfloat16, device=x.device)
     mant_out = torch.empty((total, 8, 2, 4), dtype=torch.bfloat16, device=x.device)
     dq_out = torch.empty_like(blocks) if return_dequant else None
+    selection_counts = torch.zeros(
+        _LSQ_SCALE_ITERS + 1, dtype=torch.int64, device=x.device
+    ) if _LSQ_PRINT_SELECTION and lsq_debug_label else None
 
     for start in range(0, total, _SEARCH_CHUNK_BLOCKS):
         end = min(start + _SEARCH_CHUNK_BLOCKS, total)
@@ -207,11 +212,15 @@ def _quantize_tensor_self_mse(
 
         sf = table[best_idx].view(bsz, 1, 1, 1)
         sign, mant, l2, l3 = _materialize_fixed_scale_self(xb, sf)
+        selected_round = (
+            torch.zeros(bsz, dtype=torch.int64, device=x.device)
+            if selection_counts is not None else None
+        )
 
         # Alternate between the discrete HiF4 codes and their exact continuous
         # least-squares scale.  E6M2 projection preserves the output contract;
         # retaining only strict improvements prevents refinement regressions.
-        for _ in range(_LSQ_SCALE_ITERS):
+        for lsq_round in range(1, _LSQ_SCALE_ITERS + 1):
             sf_ls = _least_squares_scale_self(xb, sign, mant, l2, l3)
             idx = _nearest_e6m2_index(sf_ls.reshape(-1), table)
             sf_try = table[idx].view(bsz, 1, 1, 1)
@@ -228,6 +237,17 @@ def _quantize_tensor_self_mse(
             mant = torch.where(mask, mant_try, mant)
             l2 = torch.where(mask, l2_try, l2)
             l3 = torch.where(mask, l3_try, l3)
+            if selected_round is not None:
+                selected_round = torch.where(
+                    better, torch.full_like(selected_round, lsq_round), selected_round
+                )
+
+        if selection_counts is not None:
+            selection_counts.add_(
+                torch.bincount(
+                    selected_round, minlength=_LSQ_SCALE_ITERS + 1
+                )
+            )
 
         sf_out[start:end] = sf.to(torch.bfloat16)
         l2_out[start:end] = l2.to(torch.bfloat16)
@@ -248,6 +268,16 @@ def _quantize_tensor_self_mse(
     dq = None
     if dq_out is not None:
         dq = dq_out.reshape(shape).to(torch.bfloat16).float()
+    if selection_counts is not None:
+        counts = selection_counts.detach().cpu().tolist()
+        fields = [f"initial={counts[0]}"]
+        fields.extend(
+            f"ls{idx}={counts[idx]}" for idx in range(1, len(counts))
+        )
+        print(
+            f"[HiF4-LSQ][{lsq_debug_label}] blocks={total} " + " ".join(fields),
+            flush=True,
+        )
     return params, dq
 
 
@@ -563,11 +593,21 @@ def _v64_dequant_params(params, shape):
         'scale_factor']).reshape(shape).float()
 
 
-def _v37_quantize_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, return_dequant=False):
+def _v37_quantize_hessian(
+        x: torch.Tensor,
+        hblocks: torch.Tensor,
+        *,
+        return_dequant=False,
+        lsq_debug_label: Optional[str] = None,
+):
     shape = tuple(int(s) for s in x.shape)
     c = shape[-1]
     if c % 64 != 0 or hblocks.dim() != 3 or tuple(hblocks.shape[1:]) != (64, 64) or hblocks.shape[0] != c // 64:
-        return _quantize_tensor_self_mse(x, return_dequant=return_dequant)
+        return _quantize_tensor_self_mse(
+            x,
+            return_dequant=return_dequant,
+            lsq_debug_label=lsq_debug_label,
+        )
     x = x.float()
     nb = c // 64
     rows = x.numel() // c
@@ -581,6 +621,9 @@ def _v37_quantize_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, return_dequ
     ma_out = torch.empty((rows, nb, 8, 2, 4), dtype=torch.bfloat16, device=x.device)
     dq_out = torch.empty_like(blocks) if return_dequant else None
     H = hblocks.to(x.device, torch.float32)
+    selection_counts = torch.zeros(
+        _LSQ_SCALE_ITERS + 1, dtype=torch.int64, device=x.device
+    ) if _LSQ_PRINT_SELECTION and lsq_debug_label else None
     chunk_rows = max(1, 4096 // max(nb, 1))
     for rs in range(0, rows, chunk_rows):
         re = min(rows, rs + chunk_rows)
@@ -590,6 +633,10 @@ def _v37_quantize_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, return_dequ
         best = torch.full((nr, nb), float('inf'), dtype=torch.float32, device=x.device)
         best_pack = None
         best_q = None
+        selected_round = (
+            torch.zeros((nr, nb), dtype=torch.int64, device=x.device)
+            if selection_counts is not None else None
+        )
         for off in _E6_ANCHOR_OFFSETS:
             idx = (anchor + off).clamp(0, last)
             sf = table[idx].view(nr, nb, 1, 1, 1)
@@ -613,7 +660,7 @@ def _v37_quantize_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, return_dequ
         # The Linear weight/activation paths use a Hessian-weighted objective,
         # so refine their base scales with the corresponding generalized
         # least-squares closed form rather than unweighted elementwise MSE.
-        for _ in range(_LSQ_SCALE_ITERS):
+        for lsq_round in range(1, _LSQ_SCALE_ITERS + 1):
             sf, l2, l3, sg, ma = best_pack
             sf_ls = _least_squares_scale_hessian(z, sg, ma, l2, l3, H)
             idx = _nearest_e6m2_index(sf_ls.reshape(-1), table)
@@ -633,6 +680,16 @@ def _v37_quantize_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, return_dequ
                 mask = better.view(nr, nb, *([1] * (v.dim() - 2)))
                 best_pack[jj] = torch.where(mask, v, best_pack[jj])
             best_q = torch.where(better[:, :, None], q_try, best_q)
+            if selected_round is not None:
+                selected_round = torch.where(
+                    better, torch.full_like(selected_round, lsq_round), selected_round
+                )
+        if selection_counts is not None:
+            selection_counts.add_(
+                torch.bincount(
+                    selected_round.reshape(-1), minlength=_LSQ_SCALE_ITERS + 1
+                )
+            )
         sf, l2, l3, sg, ma = best_pack
         sf_out[rs:re] = sf.to(torch.bfloat16)
         l2_out[rs:re] = l2.to(torch.bfloat16)
@@ -645,6 +702,17 @@ def _v37_quantize_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, return_dequ
               'scale_lv3': l3_out.reshape(*prefix, nb, 8, 2, 1), 'sign': sg_out.reshape(*prefix, nb, 8, 2, 4),
               'mant': ma_out.reshape(*prefix, nb, 8, 2, 4)}
     dq = dq_out.reshape(shape).to(torch.bfloat16).float() if dq_out is not None else None
+    if selection_counts is not None:
+        counts = selection_counts.detach().cpu().tolist()
+        fields = [f"initial={counts[0]}"]
+        fields.extend(
+            f"ls{idx}={counts[idx]}" for idx in range(1, len(counts))
+        )
+        print(
+            f"[HiF4-LSQ][{lsq_debug_label}] blocks={rows * nb} "
+            + " ".join(fields),
+            flush=True,
+        )
     return params, dq
 
 
@@ -903,7 +971,12 @@ def _safe105_dynamic(activation_quant, activation_scale, activation_state):
     H256 = st.get('super256_hessian_blocks')
     if not isinstance(H64, torch.Tensor):
         return _quantize_tensor_self_mse(y, return_dequant=False)[0]
-    p, _ = _v37_quantize_hessian(y, H64, return_dequant=False)
+    p, _ = _v37_quantize_hessian(
+        y,
+        H64,
+        return_dequant=False,
+        lsq_debug_label="linear_activation",
+    )
     if isinstance(H256, torch.Tensor):
         p = _safe90_refine256(y, p, H256, int(st.get('super256_iters', 4)))
     return p
@@ -929,9 +1002,16 @@ def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activ
     HA64 = _safe99_activation_hessian64(acts_t, int(w.shape[-1]), w.device)
     HA256 = _safe99_activation_hessian256(acts_t, int(w.shape[-1]), w.device)
 
-    wp, wq = _v37_quantize_hessian(wt, HA64, return_dequant=True) if isinstance(HA64,
-                                                                                torch.Tensor) else _quantize_tensor_self_mse(
-        wt, return_dequant=True)
+    wp, wq = _v37_quantize_hessian(
+        wt,
+        HA64,
+        return_dequant=True,
+        lsq_debug_label="linear_weight",
+    ) if isinstance(HA64, torch.Tensor) else _quantize_tensor_self_mse(
+        wt,
+        return_dequant=True,
+        lsq_debug_label="linear_weight",
+    )
 
     if isinstance(HA256, torch.Tensor):
         wp = _safe105_chunked_weight_h256(wt, wp, HA256, iters=1, chunk_rows=256)
