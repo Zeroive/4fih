@@ -21,9 +21,6 @@ _K_QUOTIENT_TOTAL_ROUNDS = 2
 _K_RELAX_GAMMAS = (1.0, 2.0)
 _K_MEDIAN_EXTRA_ROUNDS = 1
 _ATTN_HEAD_ROTATION_CANDIDATES = (-1, 0, 1)  # identity, H64, signed H64
-_ATTN_TAIL_PERCENT = 0.01
-_ATTN_TAIL_HESSIAN_WEIGHT = 0.50
-_ATTN_DIAG_DAMPING = 1.0e-4
 
 _E6_TABLE_CACHE: dict[str, torch.Tensor] = {}
 
@@ -31,7 +28,6 @@ _V31_STATE_VERSION = "v31_calib_smooth_h64_safe"
 _V42_VERSION = "v42_attention_rotcov"
 _V105_VERSION = 'v105_rulesafe_weight_cov256_chunk1'
 _V111_ATTN_HEAD_VERSION = "v111_attention_per_head"
-_V112_ATTN_TAIL_DIAG_VERSION = "v112_attention_tail_diag_hessian"
 
 
 # =============================================================================
@@ -120,39 +116,6 @@ def _materialize_fixed_scale_self(
     )
     sign = torch.sign(x)
     sign = torch.where(mant == 0.0, torch.zeros_like(sign), sign)
-    return sign, mant, l2, l3
-
-
-def _materialize_fixed_scale_diag(
-        x: torch.Tensor,
-        sf: torch.Tensor,
-        weight: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Materialize HiF4 codes while weighting shared lv2/lv3 decisions."""
-    abs_x = x.abs()
-    mant_by_mult = []
-    err_by_mult = []
-    for mult in (1.0, 2.0, 4.0):
-        denom = sf * mult
-        mant = (torch.round((abs_x / denom) * 4.0) * 0.25).clamp(0.0, 1.75)
-        mant_by_mult.append(mant)
-        err_by_mult.append(
-            (weight * (mant * denom - abs_x).square()).sum(dim=-1, keepdim=True)
-        )
-    e1, e2, e4 = err_by_mult
-    l3_if_l2_1 = torch.where(e2 < e1, 2.0, 1.0)
-    l3_if_l2_2 = torch.where(e4 < e2, 2.0, 1.0)
-    err_l2_1 = torch.minimum(e1, e2).sum(dim=-2, keepdim=True)
-    err_l2_2 = torch.minimum(e2, e4).sum(dim=-2, keepdim=True)
-    l2 = torch.where(err_l2_2 < err_l2_1, 2.0, 1.0)
-    l3 = torch.where(l2 == 1.0, l3_if_l2_1, l3_if_l2_2)
-    mult = l2 * l3
-    mant = torch.where(
-        mult == 1.0,
-        mant_by_mult[0],
-        torch.where(mult == 2.0, mant_by_mult[1], mant_by_mult[2]),
-    )
-    sign = torch.where(mant == 0.0, torch.zeros_like(x), torch.sign(x))
     return sign, mant, l2, l3
 
 
@@ -295,7 +258,6 @@ def _merge_k_candidates_per_feature_block(
         x: torch.Tensor,
         params_list: list[dict],
         dq_list: list[torch.Tensor],
-        feature_diag: Optional[torch.Tensor] = None,
 ) -> dict:
     if len(params_list) == 1 or x.dim() < 2 or int(x.shape[-2]) <= 1:
         return params_list[0]
@@ -307,18 +269,12 @@ def _merge_k_candidates_per_feature_block(
     batch_prefix = shape[:-2]
     groups = int(math.prod(batch_prefix)) if batch_prefix else 1
     x4 = x.float().reshape(groups, seq, nblocks, 64)
-    weights = None
-    if isinstance(feature_diag, torch.Tensor) and feature_diag.numel() == hidden:
-        weights = feature_diag.to(x.device, torch.float32).reshape(1, nblocks, 64)
 
     scores = []
     for dq in dq_list:
         e = dq.float().reshape(groups, seq, nblocks, 64) - x4
         e = e - e.mean(dim=1, keepdim=True)
-        square = e.square()
-        if weights is not None:
-            square = square * weights.unsqueeze(1)
-        scores.append(square.sum(dim=(1, 3)))
+        scores.append(e.square().sum(dim=(1, 3)))
     score_stack = torch.stack(scores, dim=0)
     best = score_stack.argmin(dim=0)
 
@@ -338,7 +294,6 @@ def _merge_k_candidates_per_feature_block(
 def _select_best_k_dq_per_feature_block(
         x: torch.Tensor,
         dq_list: list[torch.Tensor],
-        feature_diag: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if len(dq_list) == 1 or x.dim() < 2 or int(x.shape[-2]) <= 1:
         return dq_list[0]
@@ -349,19 +304,13 @@ def _select_best_k_dq_per_feature_block(
     batch_prefix = shape[:-2]
     groups = int(math.prod(batch_prefix)) if batch_prefix else 1
     x4 = x.float().reshape(groups, seq, nblocks, 64)
-    weights = None
-    if isinstance(feature_diag, torch.Tensor) and feature_diag.numel() == hidden:
-        weights = feature_diag.to(x.device, torch.float32).reshape(1, nblocks, 64)
     scores = []
     qs = []
     for dq in dq_list:
         q4 = dq.float().reshape(groups, seq, nblocks, 64)
         e = q4 - x4
         e = e - e.mean(dim=1, keepdim=True)
-        square = e.square()
-        if weights is not None:
-            square = square * weights.unsqueeze(1)
-        scores.append(square.sum(dim=(1, 3)))
+        scores.append(e.square().sum(dim=(1, 3)))
         qs.append(q4)
     best = torch.stack(scores, dim=0).argmin(dim=0)
     out = qs[0].clone()
@@ -550,181 +499,14 @@ def _quantize_attention_per_head(
     return params, dq
 
 
-def _quantize_attention_diag_hessian(
-        x: torch.Tensor,
-        num_heads: int,
-        head_dim: int,
-        hessian_diag,
-        *,
-        return_dequant: bool = False,
-):
-    """Per-head, per-64 weighted-MSE quantization with diagonal Hessians."""
-    shape = tuple(int(v) for v in x.shape)
-    xh = _attention_head_view(x, num_heads, head_dim)
-    head_blocks = head_dim // _HIF4_BLOCK
-    if not isinstance(hessian_diag, torch.Tensor) or hessian_diag.numel() != num_heads * head_dim:
-        return _quantize_attention_per_head(
-            x, num_heads, head_dim, return_dequant=return_dequant
-        )
-
-    prefix = tuple(int(v) for v in xh.shape[:-2])
-    rows = int(math.prod(prefix)) if prefix else 1
-    # Head-major ordering lets one compact Hessian row serve all runtime tokens
-    # from the same head without materialising a token-sized weight tensor.
-    z = xh.reshape(rows, num_heads, head_blocks, 8, 2, 4)
-    z = z.permute(1, 0, 2, 3, 4, 5).reshape(-1, 8, 2, 4)
-    hd = hessian_diag.to(x.device, torch.float32).reshape(
-        num_heads, head_blocks, 8, 2, 4
-    ).clamp_min(_ATTN_DIAG_DAMPING)
-
-    total = int(z.shape[0])
-    table = _build_e6m2_table(x.device)
-    last = int(table.numel() - 1)
-    sf_out = torch.empty((total, 1, 1, 1), dtype=torch.bfloat16, device=x.device)
-    l2_out = torch.empty((total, 8, 1, 1), dtype=torch.bfloat16, device=x.device)
-    l3_out = torch.empty((total, 8, 2, 1), dtype=torch.bfloat16, device=x.device)
-    sg_out = torch.empty((total, 8, 2, 4), dtype=torch.bfloat16, device=x.device)
-    ma_out = torch.empty((total, 8, 2, 4), dtype=torch.bfloat16, device=x.device)
-    dq_out = torch.empty_like(z) if return_dequant else None
-
-    # Flattening order is head -> runtime row -> feature block.
-    block_index = torch.arange(total, device=x.device) % (rows * head_blocks)
-    block_index = block_index % head_blocks
-    head_index = torch.arange(total, device=x.device) // (rows * head_blocks)
-
-    for start in range(0, total, _SEARCH_CHUNK_BLOCKS):
-        end = min(start + _SEARCH_CHUNK_BLOCKS, total)
-        xb = z[start:end]
-        wb = hd[head_index[start:end], block_index[start:end]]
-        bsz = int(xb.shape[0])
-        anchor = _nearest_e6m2_index(
-            xb.abs().amax(dim=(1, 2, 3)) / 7.0, table
-        )
-        best_err = torch.full((bsz,), float("inf"), device=x.device)
-        best_pack = None
-
-        for off in _E6_ANCHOR_OFFSETS:
-            idx = (anchor + off).clamp(0, last)
-            sf = table[idx].view(bsz, 1, 1, 1)
-            sg, ma, l2, l3 = _materialize_fixed_scale_diag(xb, sf, wb)
-            dq = sg * ma * l2 * l3 * sf
-            err = (wb * (dq - xb).square()).sum(dim=(1, 2, 3))
-            better = err < best_err
-            if best_pack is None:
-                best_err = err
-                best_pack = [sf, l2, l3, sg, ma]
-            else:
-                best_err = torch.where(better, err, best_err)
-                for j, value in enumerate((sf, l2, l3, sg, ma)):
-                    best_pack[j] = torch.where(
-                        better.view(bsz, 1, 1, 1), value, best_pack[j]
-                    )
-
-        for _ in range(_LSQ_SCALE_ITERS):
-            sf, l2, l3, sg, ma = best_pack
-            code = sg * ma * l2 * l3
-            numerator = (wb * xb * code).sum(dim=(1, 2, 3))
-            denominator = (wb * code.square()).sum(dim=(1, 2, 3))
-            sf_ls = (numerator / denominator.clamp_min(2.0 ** -48)).clamp_min(
-                2.0 ** -48
-            )
-            idx = _nearest_e6m2_index(sf_ls, table)
-            sf_try = table[idx].view(bsz, 1, 1, 1)
-            sg_try, ma_try, l2_try, l3_try = _materialize_fixed_scale_diag(
-                xb, sf_try, wb
-            )
-            dq_try = sg_try * ma_try * l2_try * l3_try * sf_try
-            err_try = (wb * (dq_try - xb).square()).sum(dim=(1, 2, 3))
-            better = err_try < best_err
-            best_err = torch.where(better, err_try, best_err)
-            for j, value in enumerate((sf_try, l2_try, l3_try, sg_try, ma_try)):
-                best_pack[j] = torch.where(
-                    better.view(bsz, 1, 1, 1), value, best_pack[j]
-                )
-
-        sf, l2, l3, sg, ma = best_pack
-        sf_out[start:end] = sf.to(torch.bfloat16)
-        l2_out[start:end] = l2.to(torch.bfloat16)
-        l3_out[start:end] = l3.to(torch.bfloat16)
-        sg_out[start:end] = sg.to(torch.bfloat16)
-        ma_out[start:end] = ma.to(torch.bfloat16)
-        if dq_out is not None:
-            dq_out[start:end] = sg * ma * l2 * l3 * sf
-
-    def restore(value: torch.Tensor, tail: tuple[int, ...]) -> torch.Tensor:
-        value = value.reshape(num_heads, rows, head_blocks, *tail)
-        order = (1, 0, 2, *range(3, value.dim()))
-        return value.permute(order).reshape(*prefix, num_heads, head_blocks, *tail)
-
-    raw = {
-        "scale_factor": restore(sf_out, (1, 1, 1)),
-        "scale_lv2": restore(l2_out, (8, 1, 1)),
-        "scale_lv3": restore(l3_out, (8, 2, 1)),
-        "sign": restore(sg_out, (8, 2, 4)),
-        "mant": restore(ma_out, (8, 2, 4)),
-    }
-    params = _flatten_per_head_params(raw, shape, num_heads, head_dim)
-    dq = None
-    if dq_out is not None:
-        dq = restore(dq_out, (8, 2, 4)).reshape(shape).to(torch.bfloat16).float()
-    return params, dq
-
-
 def _quantize_k_per_head(
         x: torch.Tensor,
         num_heads: int,
         head_dim: int,
-        hessian_diag=None,
 ) -> dict:
     """Run quotient search independently for every K head."""
     shape = tuple(int(v) for v in x.shape)
     xh = _attention_head_view(x, num_heads, head_dim)
-    if isinstance(hessian_diag, torch.Tensor) and hessian_diag.numel() == num_heads * head_dim:
-        feature_diag = hessian_diag.reshape(-1)
-        params_list: list[dict] = []
-        dq_list: list[torch.Tensor] = []
-
-        def add_candidate(target_heads: torch.Tensor) -> torch.Tensor:
-            target = target_heads.reshape(shape)
-            params, dq = _quantize_attention_diag_hessian(
-                target,
-                num_heads,
-                head_dim,
-                hessian_diag,
-                return_dequant=True,
-            )
-            params_list.append(params)
-            dq_list.append(dq)
-            return dq
-
-        q_best = add_candidate(xh)
-        c_prev = torch.zeros_like(xh.mean(dim=-3, keepdim=True))
-        for _ in range(1, _K_QUOTIENT_TOTAL_ROUNDS):
-            c_star = (xh - q_best.reshape_as(xh)).mean(dim=-3, keepdim=True)
-            delta = c_star - c_prev
-            for gamma in _K_RELAX_GAMMAS:
-                add_candidate(xh - (c_prev + float(gamma) * delta))
-            q_best = _select_best_k_dq_per_feature_block(
-                x, dq_list, feature_diag
-            )
-            c_prev = c_star
-
-        c_prev = xh.median(dim=-3, keepdim=True).values
-        add_candidate(xh - c_prev)
-        q_best = _select_best_k_dq_per_feature_block(x, dq_list, feature_diag)
-        for _ in range(_K_MEDIAN_EXTRA_ROUNDS):
-            c_star = (xh - q_best.reshape_as(xh)).mean(dim=-3, keepdim=True)
-            delta = c_star - c_prev
-            for gamma in _K_RELAX_GAMMAS:
-                add_candidate(xh - (c_prev + float(gamma) * delta))
-            q_best = _select_best_k_dq_per_feature_block(
-                x, dq_list, feature_diag
-            )
-            c_prev = c_star
-        return _merge_k_candidates_per_feature_block(
-            x, params_list, dq_list, feature_diag
-        )
-
     batch_prefix = shape[:-2]
     # The public interface is 2-D. Head-major layout makes every head a leading
     # group while evaluating all heads in the same quotient-search kernels.
@@ -1134,37 +916,6 @@ def _safe111_v(v_quant, v_scale, kv_num_heads, head_dim, v_state):
     )[0]
 
 
-def _attention_tail_diag_stats(xh: torch.Tensor):
-    """Mean and top-tail per-channel second moments for one calibration sample."""
-    flat = xh.float().reshape(-1, int(xh.shape[-2]), int(xh.shape[-1]))
-    tokens = int(flat.shape[0])
-    square_sum = flat.square().sum(dim=0)
-    if tokens <= 0:
-        return square_sum, 0, square_sum.clone(), 0
-    tail_count = max(1, min(tokens, int(math.ceil(tokens * _ATTN_TAIL_PERCENT))))
-    score = flat.abs().amax(dim=-1)
-    index = torch.topk(score, tail_count, dim=0, largest=True).indices.transpose(0, 1)
-    by_head = flat.transpose(0, 1)
-    tail = torch.gather(
-        by_head,
-        1,
-        index.unsqueeze(-1).expand(-1, -1, int(flat.shape[-1])),
-    )
-    return square_sum, tokens, tail.square().sum(dim=1), tail_count
-
-
-def _finish_attention_tail_diag(mean_sum, mean_count, tail_sum, tail_count):
-    mean = mean_sum / float(max(mean_count, 1))
-    tail = tail_sum / float(max(tail_count, 1))
-    return ((1.0 - _ATTN_TAIL_HESSIAN_WEIGHT) * mean
-            + _ATTN_TAIL_HESSIAN_WEIGHT * tail)
-
-
-def _normalize_attention_diag(diag):
-    normalizer = diag.mean(dim=-1, keepdim=True).clamp_min(2.0 ** -40)
-    return diag / normalizer + _ATTN_DIAG_DAMPING
-
-
 # =============================================================================
 # 最终公共 API (Public API Endpoints)
 # =============================================================================
@@ -1248,64 +999,19 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
     k_patterns = candidate_tensor[best]
     q_patterns = k_patterns.repeat_interleave(q_per_kv)
 
-    # Build the diagonal Hessians in the selected rotated coordinates. Q is
-    # weighted by K^T K; K is weighted by all Q heads sharing that KV head.
-    q_mean_sum = torch.zeros((q_num_heads, head_dim), device=first_device)
-    q_tail_sum = torch.zeros_like(q_mean_sum)
-    k_mean_sum = torch.zeros((kv_num_heads, head_dim), device=first_device)
-    k_tail_sum = torch.zeros_like(k_mean_sum)
-    q_mean_count = q_tail_count = 0
-    k_mean_count = k_tail_count = 0
-    for sample in calib_qkv_list:
-        q = dequantize_nvfp4(*sample["q"]).float().to(first_device)
-        k = dequantize_nvfp4(*sample["k"]).float().to(first_device)
-        qr = _apply_per_head_rotation(q, q_num_heads, head_dim, q_patterns)
-        kr = _apply_per_head_rotation(k, kv_num_heads, head_dim, k_patterns)
-        ms, mc, ts, tc = _attention_tail_diag_stats(qr)
-        q_mean_sum.add_(ms)
-        q_tail_sum.add_(ts)
-        q_mean_count += mc
-        q_tail_count += tc
-        ms, mc, ts, tc = _attention_tail_diag_stats(kr)
-        k_mean_sum.add_(ms)
-        k_tail_sum.add_(ts)
-        k_mean_count += mc
-        k_tail_count += tc
-
-    q_moment = _finish_attention_tail_diag(
-        q_mean_sum, q_mean_count, q_tail_sum, q_tail_count
-    )
-    k_moment = _finish_attention_tail_diag(
-        k_mean_sum, k_mean_count, k_tail_sum, k_tail_count
-    )
-    q_hessian_diag = _normalize_attention_diag(k_moment).repeat_interleave(
-        q_per_kv, dim=0
-    )
-    k_hessian_diag = q_moment.reshape(
-        kv_num_heads, q_per_kv, head_dim
-    ).sum(dim=1)
-    k_hessian_diag = _normalize_attention_diag(k_hessian_diag)
-
-    common = {
-        "version": _V112_ATTN_TAIL_DIAG_VERSION,
-        "head_dim": int(head_dim),
-        "tail_percent": float(_ATTN_TAIL_PERCENT),
-        "tail_hessian_weight": float(_ATTN_TAIL_HESSIAN_WEIGHT),
-    }
+    common = {"version": _V111_ATTN_HEAD_VERSION, "head_dim": int(head_dim)}
     return {
         "q_state": {
             **common,
             "role": "q",
             "num_heads": int(q_num_heads),
             "rotation_per_head": q_patterns.cpu(),
-            "hessian_diag_per_head": q_hessian_diag.cpu().to(torch.bfloat16),
         },
         "k_state": {
             **common,
             "role": "k",
             "num_heads": int(kv_num_heads),
             "rotation_per_head": k_patterns.cpu(),
-            "hessian_diag_per_head": k_hessian_diag.cpu().to(torch.bfloat16),
         },
         "v_state": {
             **common,
@@ -1316,22 +1022,11 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
 
 
 def hif4_dynamic_quantize_q(q_quant, q_scale, q_num_heads, head_dim, q_state):
-    if isinstance(q_state, dict) and q_state.get("version") in (
-        _V111_ATTN_HEAD_VERSION,
-        _V112_ATTN_TAIL_DIAG_VERSION,
-    ):
+    if isinstance(q_state, dict) and q_state.get("version") == _V111_ATTN_HEAD_VERSION:
         q = dequantize_nvfp4(q_quant, q_scale).float()
         qh = _apply_per_head_rotation(
             q, q_num_heads, head_dim, q_state.get("rotation_per_head")
         )
-        if q_state.get("version") == _V112_ATTN_TAIL_DIAG_VERSION:
-            return _quantize_attention_diag_hessian(
-                qh.reshape_as(q),
-                q_num_heads,
-                head_dim,
-                q_state.get("hessian_diag_per_head"),
-                return_dequant=False,
-            )[0]
         return _quantize_attention_per_head(
             qh.reshape_as(q), q_num_heads, head_dim, return_dequant=False
         )[0]
@@ -1358,20 +1053,12 @@ def hif4_dynamic_quantize_q(q_quant, q_scale, q_num_heads, head_dim, q_state):
 
 def hif4_dynamic_quantize_k(k_quant, k_scale, kv_num_heads, head_dim, k_state):
     k = dequantize_nvfp4(k_quant, k_scale).float()
-    if isinstance(k_state, dict) and k_state.get("version") in (
-        _V111_ATTN_HEAD_VERSION,
-        _V112_ATTN_TAIL_DIAG_VERSION,
-    ):
+    if isinstance(k_state, dict) and k_state.get("version") == _V111_ATTN_HEAD_VERSION:
         kh = _apply_per_head_rotation(
             k, kv_num_heads, head_dim, k_state.get("rotation_per_head")
         )
         k = kh.reshape_as(k)
-        hdiag = (
-            k_state.get("hessian_diag_per_head")
-            if k_state.get("version") == _V112_ATTN_TAIL_DIAG_VERSION
-            else None
-        )
-        return _quantize_k_per_head(k, kv_num_heads, head_dim, hdiag)
+        return _quantize_k_per_head(k, kv_num_heads, head_dim)
     return _quantize_k_per_head(k, kv_num_heads, head_dim)
 
 
