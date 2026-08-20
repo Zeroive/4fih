@@ -499,6 +499,31 @@ def _quantize_attention_per_head(
     return params, dq
 
 
+def _qk_logit_sse(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        qdq: torch.Tensor,
+        kdq: torch.Tensor,
+) -> torch.Tensor:
+    """Exact per-Q-head SSE between QK^T and dequantized HiF4 QK^T.
+
+    The Gram formulation is algebraically identical to materialising both
+    token-by-token logit matrices, but its temporary storage is O(head_dim^2)
+    instead of O(seq_len^2).
+    """
+    q_gram = torch.einsum("tgi,tgj->gij", q, q)
+    k_gram = torch.einsum("ti,tj->ij", k, k)
+    qdq_gram = torch.einsum("tgi,tgj->gij", qdq, qdq)
+    kdq_gram = torch.einsum("ti,tj->ij", kdq, kdq)
+    q_cross = torch.einsum("tgi,tgj->gij", qdq, q)
+    k_cross = torch.einsum("ti,tj->ij", kdq, k)
+
+    ref_sq = torch.einsum("gij,ij->g", q_gram, k_gram)
+    dq_sq = torch.einsum("gij,ij->g", qdq_gram, kdq_gram)
+    cross = torch.einsum("gij,ij->g", q_cross, k_cross)
+    return (ref_sq + dq_sq - 2.0 * cross).clamp_min_(0.0)
+
+
 def _quantize_k_per_head(
         x: torch.Tensor,
         num_heads: int,
@@ -961,8 +986,8 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
     q_per_kv = q_num_heads // kv_num_heads
     first_device = calib_qkv_list[0]["q"][0].device
     nc = len(_ATTN_HEAD_ROTATION_CANDIDATES)
-    qk_error = torch.zeros((kv_num_heads, nc, 2), device=first_device)
-    qk_energy = torch.zeros((kv_num_heads, nc, 2), device=first_device)
+    qk_logit_sse = torch.zeros((kv_num_heads, nc), device=first_device)
+    qk_logit_elements = torch.zeros(kv_num_heads, device=first_device)
 
     for sample in calib_qkv_list:
         q = dequantize_nvfp4(*sample["q"]).float().to(first_device)
@@ -978,20 +1003,21 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
             q_end = q_begin + q_per_kv
             q_group = q_flat[:, q_begin:q_end, :]
             k_head = k_flat[:, kv_head, :]
+            qk_logit_elements[kv_head] += (
+                int(q_group.shape[0]) * int(k_head.shape[0]) * q_per_kv
+            )
             for ci, pattern in enumerate(_ATTN_HEAD_ROTATION_CANDIDATES):
                 qt = _v35_rotate64(q_group, pattern)
                 kt = _v35_rotate64(k_head, pattern)
                 _, qdq = _quantize_tensor_self_mse(qt, return_dequant=True)
                 _, kdq = _quantize_tensor_self_mse(kt, return_dequant=True)
-                qk_error[kv_head, ci, 0] += (qdq - qt).square().sum()
-                qk_error[kv_head, ci, 1] += (kdq - kt).square().sum()
-                qk_energy[kv_head, ci, 0] += qt.square().sum()
-                qk_energy[kv_head, ci, 1] += kt.square().sum()
+                qk_logit_sse[kv_head, ci] += _qk_logit_sse(
+                    qt, kt, qdq, kdq
+                ).sum()
 
-    # Normalise Q and K separately so either operand cannot dominate solely by scale.
-    q_energy = qk_energy[..., 0].clamp_min(2.0 ** -40)
-    k_energy = qk_energy[..., 1].clamp_min(2.0 ** -40)
-    qk_score = qk_error[..., 0] / q_energy + qk_error[..., 1] / k_energy
+    # Select the rotation that minimises calibration QK-logit MSE for each KV
+    # head and all of its associated GQA query heads.
+    qk_score = qk_logit_sse / qk_logit_elements[:, None].clamp_min(1.0)
     best = qk_score.argmin(dim=1)
     candidate_tensor = torch.tensor(
         _ATTN_HEAD_ROTATION_CANDIDATES, device=first_device, dtype=torch.int64
