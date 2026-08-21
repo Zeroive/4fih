@@ -32,6 +32,7 @@ uv run python self_check_.py --solution_dir solution_collection/solution
 | `v170_` | 7/12 | `1.64686e-3` | `3.98754e-4` | `1.02281e-3` | `2648.22 ms` | `1120.25 ms` |
 | `v171_` | 7/12 | `1.64686e-3` | `3.98149e-4` | `1.02250e-3` | `3220.61 ms` | `1137.96 ms` |
 | `v172_` | 7/12 | `1.30276e-3` | `3.98149e-4` | `8.50454e-4` | `10066.14 ms` | `2335.49 ms`* |
+| `v173_` | 7/12 | `1.30202e-3` | `3.98149e-4` | `8.50085e-4` | `7260.20 ms` | `1137.85 ms` |
 
 Attention 逐项结果：
 
@@ -46,6 +47,7 @@ Attention 逐项结果：
 | `v170_` | `7.7489e-4` | `4.1870e-4` | `2.7845e-4` | `2.7061e-4` | `2.5112e-4` |
 | `v171_` | `7.7125e-4` | `4.1857e-4` | `2.8147e-4` | `2.6975e-4` | `2.4970e-4` |
 | `v172_` | `7.7125e-4` | `4.1857e-4` | `2.8147e-4` | `2.6975e-4` | `2.4970e-4` |
+| `v173_` | `7.7125e-4` | `4.1857e-4` | `2.8147e-4` | `2.6975e-4` | `2.4970e-4` |
 
 所有版本的 5 个 Attention 样本仍全部通过阈值。`v171_` 首次得到当前最低真实 GQA Attention，`v172_` 完整保留该结果并显著降低 Linear/十项平均 MSE；低时延基线仍为 `v168_`。
 
@@ -66,7 +68,7 @@ Attention 逐项结果：
 | `v168_` | 融合 v111 直接 per-head Attention 路径，移除 partner-Hessian | 7/12 | `1.64980e-3` | `2.58932e-4` | `9.54366e-4` | `2498.94 ms` | `669.64 ms` | `15.19 s` |
 | `v169_` | Linear 加入 block-64 cross-target 补偿（`lambda=0.25`） | 7/12 | `1.64686e-3` | `2.58932e-4` | `9.52896e-4` | `2771.01 ms` | `677.14 ms` | `16.11 s` |
 
-旧 fallback 口径当时推荐 `solution_collection/solution_v169_.py`；该推荐已被上面的真实 GQA 重测结论取代，当前 `solution.py` 为精度优先的 `v171_`。
+旧 fallback 口径当时推荐 `solution_collection/solution_v169_.py`；该推荐已被上面的真实 GQA 重测结论取代，当前 `solution.py` 为精度优先的 `v173_`。
 
 ## 逐项 MSE
 
@@ -79,6 +81,7 @@ Attention 逐项结果：
 | `v164_`–`v168_` | `2.1898e-3` | `1.8901e-3` | `1.4411e-3` | `1.3791e-3` | `1.3489e-3` |
 | `v169_` | `2.1868e-3` | `1.8840e-3` | `1.4396e-3` | `1.3767e-3` | `1.3472e-3` |
 | `v172_` | `1.9021e-3` | `1.4990e-3` | `1.0881e-3` | `1.0093e-3` | `1.0153e-3` |
+| `v173_` | `1.9053e-3` | `1.4998e-3` | `1.0864e-3` | `1.0056e-3` | `1.0130e-3` |
 
 结论：8 次精修的 Linear MSE 最低，但校准时延增长过大；`v169_` 在 6 次精修基础上使五项 MSE 全部下降，动态时延仅小幅增加。
 
@@ -176,6 +179,14 @@ Attention 逐项结果：
 - 受控 Linear 动态时延约增加16.8%，但 Weight calibration 明显增加；完整实测 calibration 平均 `10066.14 ms`，定位为精度优先实验版本。
 - 逻辑针对任意可被1024整除的维度保留 H1024 refinement，但 full-H2048 pair-block refinement 仅在输入维度恰为2048时生效，线上泛化需重点验证。
 
+### v173_：直接 full-H2048 十轮
+
+- 移除动态 activation 的 H1024 warm start，直接从 self-MSE 初始化进入 full-H2048 refinement，并将轮数从8增至10。
+- calibration state 不再保存 `super1024_hessian_blocks`，每个 2048维 Linear state 减少约4 MiB；动态目标只保留完整 `Wq^T Wq`，避免分块目标与最终目标切换。
+- Linear 平均 MSE从 `1.30276e-3` 小幅降至 `1.30202e-3`（约0.057%）；前两项略退，后三项改善，Attention 完全不变。
+- 同环境相邻复测中，Linear 动态均值从 v172 的约 `769.17 ms` 增至约 `782.71 ms`（约1.76%）；完整 checker 总耗时从约 `30.39 s` 降至 `29.43 s`，但时延仍应视为有负载噪声的参考值。
+- 直接 H2048 八轮/九轮平均 MSE分别为 `1.32244e-3` / `1.31090e-3`，说明 H1024 warm start 在相同8轮预算下有效；十轮才能略微超过原组合。
+
 ## 未保存实验
 
 | 实验 | 结果 | 处理 |
@@ -198,6 +209,8 @@ Attention 逐项结果：
 | E6M2 anchor 向下扩展到 `-2/-4/-8` | 三组真实 GQA 的十项 MSE 均与 v171 一致；最激进 `-8..+4` 的 Linear/Attention 平均仍为 `1.64686e-3` / `3.98148e-4`。对变换后 test Q/K/V 的 base-SSE 逐 block 统计中，`<-1` 被选次数均为 0（Q 172672 blocks，K/V 各 21584 blocks） | 放弃；额外低 scale 候选无端到端收益 |
 | Attention 两轮 permutation | 第一轮按 robust outlier score 分组后 test 平均 `4.00243e-4`；第二轮按 Hessian-weighted residual 集中分组为 `4.02958e-4`，跨 block 均衡为 `4.01525e-4`，均差于 v171 的 `3.98149e-4`；两轮版 calibration 约 `6.9–11.3 s` | 实验实现保留，不合入 solution；存在 calibration 过拟合且开销过大 |
 | `solution_tmp.py` 动态 Linear 移除小块 Hessian | 完整 H64+H256 平均 `1.24839e-3`；仅去 H64 为 `1.24224e-3`；仅去 H256 为 `1.24924e-3`；同时去 H64/H256 最佳，为 `1.23598e-3`。离线 Weight 参数保持相同，只消融 activation state/动态路径 | 小块目标与 H1024/H2048 存在冲突；值得形成 tmp 精简版后串行复测时延 |
+| Linear `H64 -> global permute -> H64` | 关闭 H1024/H2048 时，固定 perfect-shuffle 平均 MSE `2.48232e-3`、数据驱动 pressure-balanced permutation 为 `2.50572e-3`，Linear 动态均约 `121–129 ms`；恢复与 v172 相同的 H1024 + 8轮 H2048 后，数据驱动版平均 `1.49348e-3`、动态约 `793.66 ms`，仍比 v172 的 `1.30276e-3` 退化约14.6%，且 Linear calibration 增至约 `15.29 s` | 放弃；第二层 H64 使第一层形成的量化友好局部结构和 covariance 分块重新变密，额外 refinement 只能部分追回精度 |
+| Linear normalized Gram `Diagonal + Low-rank` | 以量化权重 `Wq` 的随机 SVD 构造 `D + BB^T`，替换动态 H1024/full-H2048，均使用8轮 refinement。rank-32/64/128 的 Linear 平均 MSE分别为 `1.64958e-3` / `1.60632e-3` / `1.55216e-3`，state 约 `132/260/516 KiB`；rank-128 仍比 v172 的 `1.30276e-3` 退化约19.1%。各次原始 Linear 动态均值约 `274–438 ms`，明显低于 full-H2048 的受控约 `817.79 ms`，但 CPU负载波动较大；随机低秩分解使 Linear calibration 约为 `14.3–15.5 s` | 不合入精度优先主线；权重 Gram 的谱不够低秩，适合作为低内存/低时延分支，而不能无损替代 full-H2048 |
 
 ## 历史版本复用验证
 

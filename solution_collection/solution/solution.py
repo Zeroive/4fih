@@ -1560,14 +1560,11 @@ def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activ
     wq = _v64_dequant_params(p, tuple((int(s) for s in weight_quant.shape))).float()
     for key in ('weight_hessian_blocks', 'super256_hessian_blocks', 'super512_hessian_blocks', 'super1024_hessian_blocks', 'cross1024_hessian_blocks'):
         st.pop(key, None)
-    H1024 = _v173_weight_gram_blocks(wq, 1024)
-    if isinstance(H1024, torch.Tensor):
-        st['super1024_hessian_blocks'] = H1024.cpu().to(torch.bfloat16)
     if int(wq.shape[-1]) == 2048:
         H = wq.t().matmul(wq)
         scale = H.diagonal().mean().abs().clamp_min(1e-12)
         st['full2048_hessian'] = (H / scale).cpu().to(torch.bfloat16)
-    st['version'] = 'v182_fast_compliant_gram'
+    st['version'] = 'v173_direct_full2048_10'
     return {'weight_params': p, 'activation_state': st}
 
 def _v181b_pairblock_refine(y, p, H, iters=20, block_batch=4):
@@ -1621,12 +1618,9 @@ def hif4_dynamic_quantize_activation(aq, asc, st):
     if isinstance(post, torch.Tensor):
         y = y.index_select(-1, post.to(y.device, dtype=torch.long))
     p = _quantize_tensor_self_mse(y, return_dequant=False)[0]
-    H1024 = st.get('super1024_hessian_blocks')
-    if isinstance(H1024, torch.Tensor):
-        p = _v173_refine_group(y, p, H1024.to(y.device, torch.float32), 1024, 1)
     H = st.get('full2048_hessian')
     if isinstance(H, torch.Tensor):
         p = _v181b_pairblock_refine(
-            y, p, H.to(y.device, torch.float32), 8, block_batch=4,
+            y, p, H.to(y.device, torch.float32), 10, block_batch=4,
         )
     return p
