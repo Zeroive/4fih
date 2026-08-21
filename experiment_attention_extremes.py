@@ -26,6 +26,154 @@ def load_solution():
     return module
 
 
+def enable_post_rotation_permutation(sol):
+    """Teach the experiment module to apply a shared Q/K head permutation."""
+    original_query_transform = sol._apply_query_transform
+    original_key_transform = sol._apply_key_transform
+
+    def apply_query(x, state, num_heads, head_dim):
+        y = original_query_transform(x, state, num_heads, head_dim)
+        return sol._apply_per_head_permutation(
+            y, num_heads, head_dim, state.get("post_rotation_permutation"),
+        )
+
+    def apply_key(x, state, num_heads, head_dim):
+        y = original_key_transform(x, state, num_heads, head_dim)
+        return sol._apply_per_head_permutation(
+            y, num_heads, head_dim, state.get("post_rotation_permutation"),
+        )
+
+    sol._apply_query_transform = apply_query
+    sol._apply_key_transform = apply_key
+
+
+def _base_attention_states(sol, decoded, q_heads, kv_heads, head_dim, q_perm, k_perm):
+    q_scale, k_scale = sol._compute_reciprocal_qk_scales(
+        decoded, q_heads, kv_heads, head_dim, 0.5,
+    )
+    common = {
+        "version": "attention_twopass_permutation",
+        "enabled": True,
+        "head_dim": int(head_dim),
+        "transform_kind": "per_head_rot",
+        "per_head_rotation": True,
+        "beta": 0.5,
+    }
+    return {
+        "q_state": {
+            **common, "role": "q", "scale": q_scale.cpu().float(),
+            "head_rotation_patterns": torch.full((q_heads,), 2, dtype=torch.int8),
+            "post_rotation_permutation": q_perm.cpu().to(torch.int32),
+        },
+        "k_state": {
+            **common, "role": "k", "scale": k_scale.cpu().float(),
+            "head_rotation_patterns": torch.full((kv_heads,), 2, dtype=torch.int8),
+            "post_rotation_permutation": k_perm.cpu().to(torch.int32),
+        },
+        "v_state": {
+            "version": "attention_twopass_permutation", "enabled": False, "role": "v",
+        },
+    }
+
+
+def _first_pass_outlier_permutation(sol, decoded, states, q_heads, kv_heads, head_dim):
+    queries_per_kv = q_heads // kv_heads
+    sample_scores = []
+    for q, k, _ in decoded:
+        qt = sol._apply_query_transform(q, states["q_state"], q_heads, head_dim)
+        kt = sol._apply_key_transform(k, states["k_state"], kv_heads, head_dim)
+        qh = qt.reshape(-1, kv_heads, queries_per_kv, head_dim)
+        kh = kt.reshape(-1, kv_heads, head_dim)
+        q_rms = qh.square().mean(dim=(0, 2)).sqrt().clamp_min(2.0 ** -24)
+        k_rms = kh.square().mean(dim=0).sqrt().clamp_min(2.0 ** -24)
+        q_tail = qh.abs().amax(dim=(0, 2)) / q_rms
+        k_tail = kh.abs().amax(dim=0) / k_rms
+        sample_scores.append(torch.maximum(q_tail, k_tail).log())
+    robust_score = torch.stack(sample_scores).median(dim=0).values
+    return torch.argsort(robust_score, dim=-1, descending=True, stable=True)
+
+
+def _hessian_residual_score(error, hessian):
+    gradient = torch.einsum("hde,she->shd", hessian.float(), error.float())
+    return (error.float() * gradient).abs().mean(dim=0)
+
+
+def _second_pass_residual_permutation(
+    sol, decoded, states, q_heads, kv_heads, head_dim,
+):
+    queries_per_kv = q_heads // kv_heads
+    q_hessian = states["q_state"]["partner_h256"].float()
+    k_hessian = states["k_state"]["partner_h256"].float()
+    residual_scores = []
+    for q, k, _ in decoded:
+        # Re-encode the already decoded calibration tensors through the same
+        # internal quantizers used online, without relying on NVFP4 containers.
+        qt = sol._apply_query_transform(q, states["q_state"], q_heads, head_dim)
+        qp = sol._quantize_dynamic_tensor_hessian(
+            qt, states["q_state"]["partner_h64"], q_hessian,
+            lv3_iters=1, base_mant_iters=1,
+        )
+        qdq = sol._dequantize_hif4_params(qp, tuple(qt.shape))
+        qe = (qdq - qt).reshape(-1, q_heads, head_dim)
+        q_score = _hessian_residual_score(qe, q_hessian).reshape(
+            kv_heads, queries_per_kv, head_dim,
+        ).mean(dim=1)
+
+        kt = sol._apply_key_transform(k, states["k_state"], kv_heads, head_dim)
+        kp = sol._quantize_key_with_partner_metric(
+            kt, k_hessian, kv_heads, head_dim,
+        )
+        kdq = sol._dequantize_hif4_params(kp, tuple(kt.shape))
+        ke = (kdq - kt).reshape(-1, kv_heads, head_dim)
+        ke = ke - ke.mean(dim=0, keepdim=True)
+        k_score = _hessian_residual_score(ke, k_hessian)
+
+        q_score = q_score / q_score.mean(dim=-1, keepdim=True).clamp_min(1e-20)
+        k_score = k_score / k_score.mean(dim=-1, keepdim=True).clamp_min(1e-20)
+        residual_scores.append(0.5 * (q_score + k_score))
+    score = torch.stack(residual_scores).mean(dim=0)
+    return torch.stack([
+        sol._build_balanced_feature_permutation(head_score)
+        for head_score in score
+    ])
+
+
+def build_two_pass_permutation_state(sol, group):
+    q_heads = group["q_num_heads"]
+    kv_heads = group["kv_num_heads"]
+    head_dim = group["head_dim"]
+    queries_per_kv = q_heads // kv_heads
+    decoded = sol._decode_attention_calibration(group["calib"])
+    identity_k = torch.arange(head_dim).repeat(kv_heads, 1)
+    identity_q = identity_k.repeat_interleave(queries_per_kv, dim=0)
+
+    identity_states = _base_attention_states(
+        sol, decoded, q_heads, kv_heads, head_dim, identity_q, identity_k,
+    )
+    first_k = _first_pass_outlier_permutation(
+        sol, decoded, identity_states, q_heads, kv_heads, head_dim,
+    )
+    first_q = first_k.repeat_interleave(queries_per_kv, dim=0)
+    first_states = _base_attention_states(
+        sol, decoded, q_heads, kv_heads, head_dim, first_q, first_k,
+    )
+    first_states = sol._attach_attention_covariance_state(
+        first_states, decoded, q_heads, kv_heads, head_dim,
+    )
+
+    second_k = _second_pass_residual_permutation(
+        sol, decoded, first_states, q_heads, kv_heads, head_dim,
+    )
+    final_k = first_k.gather(1, second_k)
+    final_q = final_k.repeat_interleave(queries_per_kv, dim=0)
+    final_states = _base_attention_states(
+        sol, decoded, q_heads, kv_heads, head_dim, final_q, final_k,
+    )
+    return sol._attach_attention_covariance_state(
+        final_states, decoded, q_heads, kv_heads, head_dim,
+    )
+
+
 def build_state(sol, group, beta: float, k_patterns: tuple[int, ...]):
     q_heads = group["q_num_heads"]
     kv_heads = group["kv_num_heads"]
@@ -104,7 +252,10 @@ def evaluate(sol, group, states, samples):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--mode", choices=("current", "proxy", "global", "seeds", "per-head", "beta"), required=True,
+        "--mode", choices=(
+            "current", "proxy", "global", "seeds", "per-head", "beta",
+            "two-pass-perm",
+        ), required=True,
     )
     args = parser.parse_args()
     sol = load_solution()
@@ -113,6 +264,21 @@ def main():
     )[0]
     kv_heads = group["kv_num_heads"]
     patterns = (-1, 0, 1, 2, 3)
+    if args.mode == "two-pass-perm":
+        enable_post_rotation_permutation(sol)
+        started = time.perf_counter()
+        state = build_two_pass_permutation_state(sol, group)
+        calibration_time = time.perf_counter() - started
+        calibration_errors, _ = evaluate(sol, group, state, group["calib"])
+        test_errors, elapsed = evaluate(sol, group, state, group["test"])
+        print(
+            f"two_pass_perm calib_time={calibration_time:.3f}s "
+            f"calib_mean={sum(calibration_errors) / len(calibration_errors):.8e} "
+            f"test_mean={sum(test_errors) / len(test_errors):.8e} "
+            f"test_worst={max(test_errors):.8e} elapsed={elapsed:.3f}s "
+            f"test={[f'{value:.8e}' for value in test_errors]}"
+        )
+        return
     if args.mode == "proxy":
         decoded = sol._decode_attention_calibration(group["calib"])
         q_scale, k_scale = sol._compute_reciprocal_qk_scales(

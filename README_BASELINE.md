@@ -31,6 +31,7 @@ uv run python self_check_.py --solution_dir solution_collection/solution
 | `v169_` | 7/12 | `1.64686e-3` | `4.51886e-4` | `1.04937e-3` | `2473.78 ms` | `699.84 ms` |
 | `v170_` | 7/12 | `1.64686e-3` | `3.98754e-4` | `1.02281e-3` | `2648.22 ms` | `1120.25 ms` |
 | `v171_` | 7/12 | `1.64686e-3` | `3.98149e-4` | `1.02250e-3` | `3220.61 ms` | `1137.96 ms` |
+| `v172_` | 7/12 | `1.30276e-3` | `3.98149e-4` | `8.50454e-4` | `10066.14 ms` | `2335.49 ms`* |
 
 Attention 逐项结果：
 
@@ -44,8 +45,11 @@ Attention 逐项结果：
 | `v168_`–`v169_` | `7.9804e-4` | `4.7382e-4` | `3.4094e-4` | `3.3432e-4` | `3.1231e-4` |
 | `v170_` | `7.7489e-4` | `4.1870e-4` | `2.7845e-4` | `2.7061e-4` | `2.5112e-4` |
 | `v171_` | `7.7125e-4` | `4.1857e-4` | `2.8147e-4` | `2.6975e-4` | `2.4970e-4` |
+| `v172_` | `7.7125e-4` | `4.1857e-4` | `2.8147e-4` | `2.6975e-4` | `2.4970e-4` |
 
-所有版本的 5 个 Attention 样本仍全部通过阈值。`v171_` 的真实 GQA Attention 与十项平均 MSE 最低，但相对 `v170_` 的收益仅约 0.15%，需要线上验证；低时延基线仍为 `v168_`。
+所有版本的 5 个 Attention 样本仍全部通过阈值。`v171_` 首次得到当前最低真实 GQA Attention，`v172_` 完整保留该结果并显著降低 Linear/十项平均 MSE；低时延基线仍为 `v168_`。
+
+\* `v172_` 完整 checker 运行时 Attention 同路径时延也异常升高；单独受控 Linear A/B 中，8轮版本平均动态时延约 `817.79 ms`，v171 Linear 约 `700.09 ms`，增幅约 16.8%。表中 `2335.49 ms` 是该次整轮实测值，不能全部归因于新增 Linear 逻辑。
 
 ## 旧版展平 fallback 版本总览
 
@@ -74,6 +78,7 @@ Attention 逐项结果：
 | `v163_` | `2.1857e-3` | `1.8841e-3` | `1.4340e-3` | `1.3701e-3` | `1.3417e-3` |
 | `v164_`–`v168_` | `2.1898e-3` | `1.8901e-3` | `1.4411e-3` | `1.3791e-3` | `1.3489e-3` |
 | `v169_` | `2.1868e-3` | `1.8840e-3` | `1.4396e-3` | `1.3767e-3` | `1.3472e-3` |
+| `v172_` | `1.9021e-3` | `1.4990e-3` | `1.0881e-3` | `1.0093e-3` | `1.0153e-3` |
 
 结论：8 次精修的 Linear MSE 最低，但校准时延增长过大；`v169_` 在 6 次精修基础上使五项 MSE 全部下降，动态时延仅小幅增加。
 
@@ -162,6 +167,15 @@ Attention 逐项结果：
 - calibration Attention 平均 MSE 从 `4.34315e-4` 降至 `4.33899e-4`，test 平均从 `3.98754e-4` 降至 `3.98149e-4`，最坏样本也改善。
 - 收益很小且本地仅有一个 Attention group，作为低风险实验快照保留，是否泛化必须以线上分数为准。
 
+### v172_：H1024/H2048 Linear 精度优先折中
+
+- Attention 完整保留 v171 的 reciprocal Smooth、signed-H64 seed2、partner Hessian 和 K refinement，五项 MSE逐项一致。
+- Linear Weight calibration 增加 pairwise hierarchy、H1024 activation covariance 与 quantized-weight Gram refinement；动态 activation 使用 self-MSE 初始化、1轮 H1024 refinement 和8轮 full-H2048 pair-block refinement。
+- 根据消融结果，最终 activation state 不保存 H64/H256；同时移除两者比完整小块+大块层级的 Linear 平均 MSE再降低约 0.99%，并减少约 1.25 MiB state。
+- Linear 平均 MSE相对 v171 降低约20.9%，十项平均降低约16.8%；本地通过数仍为7/12，因为8轮折中下最后两项略高于 `1e-3`。
+- 受控 Linear 动态时延约增加16.8%，但 Weight calibration 明显增加；完整实测 calibration 平均 `10066.14 ms`，定位为精度优先实验版本。
+- 逻辑针对任意可被1024整除的维度保留 H1024 refinement，但 full-H2048 pair-block refinement 仅在输入维度恰为2048时生效，线上泛化需重点验证。
+
 ## 未保存实验
 
 | 实验 | 结果 | 处理 |
@@ -181,6 +195,9 @@ Attention 逐项结果：
 | 仅 V tail-aware scale | Attention 平均退化到约 `4.04333e-4` | 放弃 |
 | V attention-mass importance | HiF4 参数按 token/block 独立，统一 token 权重不改变该 block 的 argmin | 当前格式下不增加无效逻辑 |
 | softmax-sensitivity covariance | calibration 平均改善约 2.7%，test 平均退化到约 `4.00864e-4` | 放弃，calibration 过拟合 |
+| E6M2 anchor 向下扩展到 `-2/-4/-8` | 三组真实 GQA 的十项 MSE 均与 v171 一致；最激进 `-8..+4` 的 Linear/Attention 平均仍为 `1.64686e-3` / `3.98148e-4`。对变换后 test Q/K/V 的 base-SSE 逐 block 统计中，`<-1` 被选次数均为 0（Q 172672 blocks，K/V 各 21584 blocks） | 放弃；额外低 scale 候选无端到端收益 |
+| Attention 两轮 permutation | 第一轮按 robust outlier score 分组后 test 平均 `4.00243e-4`；第二轮按 Hessian-weighted residual 集中分组为 `4.02958e-4`，跨 block 均衡为 `4.01525e-4`，均差于 v171 的 `3.98149e-4`；两轮版 calibration 约 `6.9–11.3 s` | 实验实现保留，不合入 solution；存在 calibration 过拟合且开销过大 |
+| `solution_tmp.py` 动态 Linear 移除小块 Hessian | 完整 H64+H256 平均 `1.24839e-3`；仅去 H64 为 `1.24224e-3`；仅去 H256 为 `1.24924e-3`；同时去 H64/H256 最佳，为 `1.23598e-3`。离线 Weight 参数保持相同，只消融 activation state/动态路径 | 小块目标与 H1024/H2048 存在冲突；值得形成 tmp 精简版后串行复测时延 |
 
 ## 历史版本复用验证
 
