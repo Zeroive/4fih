@@ -1063,7 +1063,7 @@ def _v156_linear(weight_quant, weight_scale, calib_activation_list):
     if isinstance(H256, torch.Tensor):
         wp = _safe105_chunked_weight_h256(wt, wp, H256, iters=4, chunk_rows=256)
     wq = _v64_dequant_params(wp, tuple(w.shape)).float()
-    st = _safe105_make_state('v156', s, perm, had, ph, wq, {'post_perm': post.cpu().to(torch.int32), 'post_perm_enabled': True, 'rho64_mean': float(r64.mean()), 'rho256_mean': float(r256.mean())})
+    st = _safe105_make_state('v156', s, perm, had, ph, wq, {'post_perm': post.cpu().to(torch.int32), 'post_perm_enabled': True, 'rho64_mean': float(r64.mean()) if isinstance(r64, torch.Tensor) else 0.0, 'rho256_mean': float(r256.mean()) if isinstance(r256, torch.Tensor) else 0.0})
     return {'weight_params': wp, 'activation_state': st}
 
 def _v158_lv3_greedy(y, p, H256, iters=2):
@@ -1558,13 +1558,23 @@ def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activ
     if isinstance(HA1024, torch.Tensor):
         p = _v174_chunk_weight(wt, p, HA1024, 1024, 128, 2)
     wq = _v64_dequant_params(p, tuple((int(s) for s in weight_quant.shape))).float()
-    for key in ('weight_hessian_blocks', 'super256_hessian_blocks', 'super512_hessian_blocks', 'super1024_hessian_blocks', 'cross1024_hessian_blocks'):
+    for key in ('weight_hessian_blocks', 'super256_hessian_blocks', 'super512_hessian_blocks', 'super1024_hessian_blocks', 'cross1024_hessian_blocks', 'full2048_hessian'):
         st.pop(key, None)
-    if int(wq.shape[-1]) == 2048:
+    k = int(wq.shape[-1])
+    if k == 2048:
         H = wq.t().matmul(wq)
         scale = H.diagonal().mean().abs().clamp_min(1e-12)
         st['full2048_hessian'] = (H / scale).cpu().to(torch.bfloat16)
-    st['version'] = 'v173_direct_full2048_10'
+    elif k % 1024 == 0:
+        H = _v173_weight_gram_blocks(wq, 1024)
+        st['super1024_hessian_blocks'] = H.cpu().to(torch.bfloat16)
+    elif k % 256 == 0:
+        H = _v173_weight_gram_blocks(wq, 256)
+        st['super256_hessian_blocks'] = H.cpu().to(torch.bfloat16)
+    elif k % 64 == 0:
+        H = _v173_weight_gram_blocks(wq, 64)
+        st['weight_hessian_blocks'] = H.cpu().to(torch.bfloat16)
+    st['version'] = 'v174_dynamic_hessian_fallback'
     return {'weight_params': p, 'activation_state': st}
 
 def _v181b_pairblock_refine(y, p, H, iters=20, block_batch=4):
@@ -1623,4 +1633,10 @@ def hif4_dynamic_quantize_activation(aq, asc, st):
         p = _v181b_pairblock_refine(
             y, p, H.to(y.device, torch.float32), 10, block_batch=4,
         )
+    elif isinstance(st.get('super1024_hessian_blocks'), torch.Tensor):
+        p = _v173_refine_group(y, p, st['super1024_hessian_blocks'].to(y.device, torch.float32), 1024, 10)
+    elif isinstance(st.get('super256_hessian_blocks'), torch.Tensor):
+        p = _v173_refine_group(y, p, st['super256_hessian_blocks'].to(y.device, torch.float32), 256, 10)
+    elif isinstance(st.get('weight_hessian_blocks'), torch.Tensor):
+        p = _v173_refine_group(y, p, st['weight_hessian_blocks'].to(y.device, torch.float32), 64, 10)
     return p
