@@ -25,8 +25,9 @@ uv run python self_check_.py --solution_dir solution_collection/solution
 | `v166_` | 短序列 K 使用 partner-covariance quotient，跳过额外 H256 repair | 7/12 | `1.64980e-3` | `3.32902e-4` | `9.91351e-4` | `2778.13 ms` | `1134.24 ms` | `20.37 s` |
 | `v167_` | K metric 按 KV head 做可靠性 covariance shrinkage | 7/12 | `1.64980e-3` | `3.32258e-4` | `9.91029e-4` | `2900.99 ms` | `1141.93 ms` | `20.82 s` |
 | `v168_` | 融合 v111 直接 per-head Attention 路径，移除 partner-Hessian | 7/12 | `1.64980e-3` | `2.58932e-4` | `9.54366e-4` | `2498.94 ms` | `669.64 ms` | `15.19 s` |
+| `v169_` | Linear 加入 block-64 cross-target 补偿（`lambda=0.25`） | 7/12 | `1.64686e-3` | `2.58932e-4` | `9.52896e-4` | `2771.01 ms` | `677.14 ms` | `16.11 s` |
 
-当前推荐版本：`solution_collection/solution_v168_.py`。当前 `solution.py` 与该版本一致。
+当前推荐版本：`solution_collection/solution_v169_.py`。当前 `solution.py` 与该版本一致；若极端重视最低时延，可回退 `v168_`。
 
 ## 逐项 MSE
 
@@ -37,8 +38,9 @@ uv run python self_check_.py --solution_dir solution_collection/solution
 | `v162` | `2.1942e-3` | `1.9064e-3` | `1.4630e-3` | `1.4059e-3` | `1.3696e-3` |
 | `v163_` | `2.1857e-3` | `1.8841e-3` | `1.4340e-3` | `1.3701e-3` | `1.3417e-3` |
 | `v164_`–`v168_` | `2.1898e-3` | `1.8901e-3` | `1.4411e-3` | `1.3791e-3` | `1.3489e-3` |
+| `v169_` | `2.1868e-3` | `1.8840e-3` | `1.4396e-3` | `1.3767e-3` | `1.3472e-3` |
 
-结论：8 次精修的 Linear MSE 最低，但校准时延增长过大；6 次精修是当前折中方案。
+结论：8 次精修的 Linear MSE 最低，但校准时延增长过大；`v169_` 在 6 次精修基础上使五项 MSE 全部下降，动态时延仅小幅增加。
 
 ### Attention
 
@@ -48,7 +50,7 @@ uv run python self_check_.py --solution_dir solution_collection/solution
 | `v165_` | `1.0805e-3` | `2.5601e-4` | `1.7477e-4` | `1.4020e-4` | `1.4892e-4` |
 | `v166_` | `9.4461e-4` | `2.5601e-4` | `1.7477e-4` | `1.4020e-4` | `1.4892e-4` |
 | `v167_` | `9.4461e-4` | `2.5696e-4` | `1.7064e-4` | `1.4017e-4` | `1.4891e-4` |
-| `v168_` | `7.4076e-4` | `1.9035e-4` | `1.3298e-4` | `1.1700e-4` | `1.1357e-4` |
+| `v168_`–`v169_` | `7.4076e-4` | `1.9035e-4` | `1.3298e-4` | `1.1700e-4` | `1.1357e-4` |
 
 结论：`v166_` 首次使短序列 Attention 通过；`v168_` 融合 v111 的直接 per-head 路径后，同时显著降低 Attention MSE 和动态时延。
 
@@ -102,6 +104,14 @@ uv run python self_check_.py --solution_dir solution_collection/solution
 - 平均动态时延从约 `1141.93 ms` 降到 `669.64 ms`。
 - 删除失效路径后，`solution.py` 从约 1930 行进一步精简到 1381 行。
 
+### v169_：Linear cross-target 补偿
+
+- 在每个 64 维块上，用 calibration 统计量求解 `T = (H + eps I)^-1 (B + eps I)`，近似补偿量化权重输出到目标输出之间的系统误差。
+- 动态阶段以 `lambda=0.25` 混合普通输出与补偿输出，再沿用原有 H64/H256 分层量化；不依赖样本内容或固定 token 数。
+- 五项 Linear MSE 全部下降，平均值相对 `v168_` 降低约 0.18%；Attention 路径及结果完全不变。
+- 稳定复测中平均动态时延从 `669.64 ms` 增至 `677.14 ms`，约增加 1.1%；主要额外总耗时来自 calibration。
+- `lambda=0.75` 的本地平均 MSE 略低，但首项退化；为降低本地过拟合风险，保留五项一致改善的 `lambda=0.25`。
+
 ## 未保存实验
 
 | 实验 | 结果 | 处理 |
@@ -112,6 +122,8 @@ uv run python self_check_.py --solution_dir solution_collection/solution
 | Q/K covariance 同时可靠性收缩 | 中长序列改善，但短序列退化；Attention 平均 MSE 约 `3.3701e-4` | 放弃 |
 | 仅 Q covariance 收缩 | 10/128 token 退化，平均无收益 | 放弃 |
 | K hierarchy candidate 接受阈值 | 所有长序列 candidate 的 metric 改善均远超阈值，head 选择完全不变 | 不增加无效逻辑 |
+| 用 cross-target objective 完全替换现有 Linear hierarchy | `lambda=0.25` 相对该简化路径自身略有改善，但整体明显差于 `v168_` | 保留现有 hierarchy，仅叠加补偿 |
+| cross-target 补偿仅保留对角项 | 各有效 `lambda` 均劣于完整 64x64 补偿；`lambda=0.25` 平均约 `1.66436e-3` | 放弃 |
 
 ## 历史版本复用验证
 
