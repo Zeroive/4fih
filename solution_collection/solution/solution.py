@@ -19,13 +19,7 @@ _NVFP4_BLOCK = 16
 
 _SEARCH_CHUNK_BLOCKS = 16384
 
-_E6M2_EXPONENT_BITS = 6
-
-_E6M2_MANTISSA_BITS = 2
-
-_E6M2_EXPONENT_BIAS = 48
-
-_E6M2_MAX_FINITE_MANTISSA_CODE = 2
+_E6_ANCHOR_OFFSETS = (-1, 0, 1, 2, 3, 4)
 
 _K_QUOTIENT_TOTAL_ROUNDS = 8
 
@@ -34,30 +28,6 @@ _K_RELAX_GAMMAS = (1.0, 1.5, 2.0, 2.5)
 _K_MEDIAN_EXTRA_ROUNDS = 3
 
 _E6_TABLE_CACHE: dict[str, torch.Tensor] = {}
-
-
-def _all_finite_e6m2_values() -> tuple[float, ...]:
-    """Return every positive finite value encoded by unsigned E6M2."""
-    exponent_count = 1 << _E6M2_EXPONENT_BITS
-    mantissa_count = 1 << _E6M2_MANTISSA_BITS
-    mantissa_denominator = float(mantissa_count)
-    values = []
-    for exponent_code in range(exponent_count):
-        max_mantissa_code = (
-            _E6M2_MAX_FINITE_MANTISSA_CODE
-            if exponent_code == exponent_count - 1
-            else mantissa_count - 1
-        )
-        exponent = exponent_code - _E6M2_EXPONENT_BIAS
-        for mantissa_code in range(max_mantissa_code + 1):
-            significand = 1.0 + mantissa_code / mantissa_denominator
-            values.append(math.ldexp(significand, exponent))
-    return tuple(values)
-
-
-_E6M2_FINITE_VALUES = _all_finite_e6m2_values()
-_E6M2_MIN_FINITE = _E6M2_FINITE_VALUES[0]
-_E6M2_MAX_FINITE = _E6M2_FINITE_VALUES[-1]
 
 def dequantize_nvfp4(
     quant_float: torch.Tensor,
@@ -79,39 +49,25 @@ def _build_e6m2_table(device: torch.device) -> torch.Tensor:
     cached = _E6_TABLE_CACHE.get(key)
     if cached is not None and cached.device == device:
         return cached
-    table = torch.tensor(_E6M2_FINITE_VALUES, dtype=torch.float32, device=device)
+    values = []
+    for e in range(-48, 16):
+        for m in (1.0, 1.25, 1.5, 1.75):
+            v = math.ldexp(m, e)
+            if v <= 49152.0:
+                values.append(v)
+    table = torch.tensor(values, dtype=torch.float32, device=device)
     _E6_TABLE_CACHE[key] = table
     return table
 
 def _nearest_e6m2_index(target: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
     # Avoid table[0].item()/table[-1].item() device synchronizations on accelerators.
-    t = target.clamp(min=_E6M2_MIN_FINITE, max=_E6M2_MAX_FINITE)
+    t = target.clamp(min=2.0 ** -48, max=49152.0)
     hi = torch.searchsorted(table, t).clamp(0, table.numel() - 1)
     lo = (hi - 1).clamp(0, table.numel() - 1)
     vlo = table[lo]
     vhi = table[hi]
     choose_hi = (vhi - t).abs() < (t - vlo).abs()
     return torch.where(choose_hi, hi, lo)
-
-
-def _e6m2_anchor_candidates(
-    anchor: torch.Tensor,
-    table: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Gather each anchor's actual candidate values from the complete E6M2 table."""
-    last = int(table.numel() - 1)
-    first = (anchor - 1).clamp(0, last)
-    codes_per_exponent = 1 << _E6M2_MANTISSA_BITS
-    final = (anchor + codes_per_exponent).clamp(0, last)
-
-    candidate_count = final - first + 1
-    width = int(candidate_count.amax().item())
-    slots = torch.arange(width, dtype=anchor.dtype, device=anchor.device)
-    slot_shape = (1,) * anchor.dim() + (width,)
-    indices = first.unsqueeze(-1) + slots.reshape(slot_shape)
-    valid = indices <= final.unsqueeze(-1)
-    values = table[indices.clamp_max(last)]
-    return values, valid
 
 def _fixed_scale_self_sse(abs_x: torch.Tensor, sf: torch.Tensor) -> torch.Tensor:
     """Exact minimum unweighted SSE for a fixed E6M2 level-1 scale."""
@@ -181,6 +137,7 @@ def _quantize_tensor_self_mse(
     total = int(blocks.shape[0])
 
     table = _build_e6m2_table(x.device)
+    last = int(table.numel() - 1)
 
     sf_out = torch.empty((total, 1, 1, 1), dtype=torch.bfloat16, device=x.device)
     l2_out = torch.empty((total, 8, 1, 1), dtype=torch.bfloat16, device=x.device)
@@ -200,18 +157,16 @@ def _quantize_tensor_self_mse(
         anchor = _nearest_e6m2_index(block_max / 7.0, table)
 
         best_err = torch.full((bsz,), float("inf"), dtype=torch.float32, device=x.device)
-        best_sf = table[anchor]
-        candidate_values, candidate_valid = _e6m2_anchor_candidates(anchor, table)
-        for candidate_slot in range(candidate_values.shape[-1]):
-            candidate_sf = candidate_values[:, candidate_slot]
-            sf = candidate_sf.view(bsz, 1, 1, 1)
-            valid = candidate_valid[:, candidate_slot]
-            err = _fixed_scale_self_sse(ax, sf).masked_fill(~valid, float("inf"))
+        best_idx = anchor.clone()
+        for off in _E6_ANCHOR_OFFSETS:
+            idx = (anchor + off).clamp(0, last)
+            sf = table[idx].view(bsz, 1, 1, 1)
+            err = _fixed_scale_self_sse(ax, sf)
             better = err < best_err
             best_err = torch.where(better, err, best_err)
-            best_sf = torch.where(better, candidate_sf, best_sf)
+            best_idx = torch.where(better, idx, best_idx)
 
-        sf = best_sf.view(bsz, 1, 1, 1)
+        sf = table[best_idx].view(bsz, 1, 1, 1)
         sign, mant, l2, l3 = _materialize_fixed_scale_self(xb, sf)
 
         sf_out[start:end] = sf.to(torch.bfloat16)
@@ -573,7 +528,7 @@ def _quantize_with_block_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, retu
         return _quantize_tensor_self_mse(x,return_dequant=return_dequant)
     x=x.float(); nb=c//64; rows=x.numel()//c
     blocks=x.reshape(rows,nb,8,2,4)
-    table=_build_e6m2_table(x.device)
+    table=_build_e6m2_table(x.device); last=int(table.numel()-1)
     sf_out=torch.empty((rows,nb,1,1,1),dtype=torch.bfloat16,device=x.device)
     l2_out=torch.empty((rows,nb,8,1,1),dtype=torch.bfloat16,device=x.device)
     l3_out=torch.empty((rows,nb,8,2,1),dtype=torch.bfloat16,device=x.device)
@@ -588,13 +543,11 @@ def _quantize_with_block_hessian(x: torch.Tensor, hblocks: torch.Tensor, *, retu
         anchor=_nearest_e6m2_index(z.abs().amax((2,3,4))/7.0,table)
         best=torch.full((nr,nb),float('inf'),dtype=torch.float32,device=x.device)
         best_pack=None;best_q=None
-        candidate_values,candidate_valid=_e6m2_anchor_candidates(anchor,table)
-        for candidate_slot in range(candidate_values.shape[-1]):
-            valid=candidate_valid[...,candidate_slot]
-            sf=candidate_values[...,candidate_slot].view(nr,nb,1,1,1)
+        for off in _E6_ANCHOR_OFFSETS:
+            idx=(anchor+off).clamp(0,last);sf=table[idx].view(nr,nb,1,1,1)
             sg,ma,l2,l3=_materialize_fixed_scale_self(z,sf)
             q=(sg*ma*l2*l3*sf).reshape(nr,nb,64);e=q-z.reshape(nr,nb,64)
-            err=torch.einsum('rbi,bij,rbj->rb',e,H,e).masked_fill(~valid,float('inf'))
+            err=torch.einsum('rbi,bij,rbj->rb',e,H,e)
             better=err<best
             if best_pack is None:
                 best=err;best_pack=[sf.clone(),l2.clone(),l3.clone(),sg.clone(),ma.clone()];best_q=q.clone()
@@ -860,7 +813,7 @@ def _refine_scales_hessian_256(y,p,H256,sweeps=1):
             c=qcur/sfcur.unsqueeze(-1)
             den=torch.einsum('rgi,gij,rgj->rg',c,Hss,c).clamp_min(1e-20)
             num=(c*gcur).sum(-1)
-            sfstar=(sfcur-num/den).clamp(min=_E6M2_MIN_FINITE,max=_E6M2_MAX_FINITE)
+            sfstar=(sfcur-num/den).clamp(min=2.0**-48,max=49152.0)
 
             curidx=_nearest_e6m2_index(sfcur,table)
             optidx=_nearest_e6m2_index(sfstar,table)
