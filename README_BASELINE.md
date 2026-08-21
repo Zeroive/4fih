@@ -70,7 +70,7 @@ Attention 逐项结果：
 | `v168_` | 融合 v111 直接 per-head Attention 路径，移除 partner-Hessian | 7/12 | `1.64980e-3` | `2.58932e-4` | `9.54366e-4` | `2498.94 ms` | `669.64 ms` | `15.19 s` |
 | `v169_` | Linear 加入 block-64 cross-target 补偿（`lambda=0.25`） | 7/12 | `1.64686e-3` | `2.58932e-4` | `9.52896e-4` | `2771.01 ms` | `677.14 ms` | `16.11 s` |
 
-旧 fallback 口径当时推荐 `solution_collection/solution_v169_.py`；该推荐已被上面的真实 GQA 重测结论取代，当前 `solution.py` 为精度优先且支持维度降级的 `v174_`。
+旧 fallback 口径当时推荐 `solution_collection/solution_v169_.py`；该推荐已被上面的真实 GQA 重测结论取代。当前 `solution.py` 以 `v174_` 为精度基线，并额外加入了下文记录的通用 full-Hessian refinement；该改动不另编号，因为本地 2048 维 MSE 没有变化。
 
 ## 逐项 MSE
 
@@ -197,6 +197,14 @@ Attention 逐项结果：
 - 修复 `k<256` 时 H256 reliability 不存在却读取 `mean()` 的原有错误；合成测试确认 `k=64/256/1024` 分别生成并使用正确形状的 block Hessian。
 - 本地正式数据维度为2048，因此五项 Linear、五项 Attention 与 v173 逐项一致；完整复测为7/12，平均 calibration `7447.54 ms`、平均动态 `1164.91 ms`、总耗时 `30.18 s`。
 
+### 当前 solution.py：full-Hessian 通用化（未另存版本）
+
+- 将仅支持 2048 维的 `_v181b_pairblock_refine` 泛化为 `_refine_full_hessian_batched`，支持任意 `k % 64 == 0`；最后不足 `block_batch` 的 block 也按实际数量处理。
+- `k <= 2048` 时统一保存完整 `k×k` quantized-weight Gram，因此 64/256/512/1024/1536/2048 等维度都保留全部通道相关性；`k > 2048` 才继续按 H1024/H256/H64 降级，控制 state 和计算量。
+- 合成验证覆盖 `k=64/256/512/1024/1536`；2048 维新旧 refinement 的所有输出参数逐元素完全一致。
+- 完整 checker 的 Linear 五项仍为 `1.9053e-3 / 1.4998e-3 / 1.0864e-3 / 1.0056e-3 / 1.0130e-3`，Attention 五项也与 v174 完全一致。该次平均 calibration/dynamic 为 `9219.11/1461.41 ms`、总耗时 `37.32 s`；由于 2048 路径新旧数值和运算结构等价，将本次时延上浮记为 CPU 负载噪声，不作为算法时延退化结论。
+- 本次是通用性和命名改进，没有本地 MSE 收益，因此不创建新的 `solution_vxxx_.py`。
+
 ## 未保存实验
 
 | 实验 | 结果 | 处理 |
@@ -221,6 +229,7 @@ Attention 逐项结果：
 | `solution_tmp.py` 动态 Linear 移除小块 Hessian | 完整 H64+H256 平均 `1.24839e-3`；仅去 H64 为 `1.24224e-3`；仅去 H256 为 `1.24924e-3`；同时去 H64/H256 最佳，为 `1.23598e-3`。离线 Weight 参数保持相同，只消融 activation state/动态路径 | 小块目标与 H1024/H2048 存在冲突；值得形成 tmp 精简版后串行复测时延 |
 | Linear `H64 -> global permute -> H64` | 关闭 H1024/H2048 时，固定 perfect-shuffle 平均 MSE `2.48232e-3`、数据驱动 pressure-balanced permutation 为 `2.50572e-3`，Linear 动态均约 `121–129 ms`；恢复与 v172 相同的 H1024 + 8轮 H2048 后，数据驱动版平均 `1.49348e-3`、动态约 `793.66 ms`，仍比 v172 的 `1.30276e-3` 退化约14.6%，且 Linear calibration 增至约 `15.29 s` | 放弃；第二层 H64 使第一层形成的量化友好局部结构和 covariance 分块重新变密，额外 refinement 只能部分追回精度 |
 | Linear normalized Gram `Diagonal + Low-rank` | 以量化权重 `Wq` 的随机 SVD 构造 `D + BB^T`，替换动态 H1024/full-H2048，均使用8轮 refinement。rank-32/64/128 的 Linear 平均 MSE分别为 `1.64958e-3` / `1.60632e-3` / `1.55216e-3`，state 约 `132/260/516 KiB`；rank-128 仍比 v172 的 `1.30276e-3` 退化约19.1%。各次原始 Linear 动态均值约 `274–438 ms`，明显低于 full-H2048 的受控约 `817.79 ms`，但 CPU负载波动较大；随机低秩分解使 Linear calibration 约为 `14.3–15.5 s` | 不合入精度优先主线；权重 Gram 的谱不够低秩，适合作为低内存/低时延分支，而不能无损替代 full-H2048 |
+| full-Hessian refinement 32轮 | Linear 五项为 `1.8303e-3 / 1.4319e-3 / 1.0342e-3 / 9.5436e-4 / 9.6453e-4`，平均 `1.24306e-3`，相对10轮的 `1.30202e-3` 改善约 `4.53%`；通过数从 `7/12` 提升到 `9/12`。相邻运行 Linear 动态均值从约 `1053 ms` 增至 `2839 ms`，约为 `2.70×`；整轮平均动态时延从 `1461.41 ms` 增至 `2451.19 ms` | 精度有收益，但时延增长过大；恢复10轮，不保存版本 |
 
 ## 历史版本复用验证
 

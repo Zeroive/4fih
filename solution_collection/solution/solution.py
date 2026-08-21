@@ -1558,13 +1558,13 @@ def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activ
     if isinstance(HA1024, torch.Tensor):
         p = _v174_chunk_weight(wt, p, HA1024, 1024, 128, 2)
     wq = _v64_dequant_params(p, tuple((int(s) for s in weight_quant.shape))).float()
-    for key in ('weight_hessian_blocks', 'super256_hessian_blocks', 'super512_hessian_blocks', 'super1024_hessian_blocks', 'cross1024_hessian_blocks', 'full2048_hessian'):
+    for key in ('weight_hessian_blocks', 'super256_hessian_blocks', 'super512_hessian_blocks', 'super1024_hessian_blocks', 'cross1024_hessian_blocks', 'full_hessian', 'full2048_hessian'):
         st.pop(key, None)
     k = int(wq.shape[-1])
-    if k == 2048:
+    if k <= 2048 and k % 64 == 0:
         H = wq.t().matmul(wq)
         scale = H.diagonal().mean().abs().clamp_min(1e-12)
-        st['full2048_hessian'] = (H / scale).cpu().to(torch.bfloat16)
+        st['full_hessian'] = (H / scale).cpu().to(torch.bfloat16)
     elif k % 1024 == 0:
         H = _v173_weight_gram_blocks(wq, 1024)
         st['super1024_hessian_blocks'] = H.cpu().to(torch.bfloat16)
@@ -1574,34 +1574,38 @@ def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activ
     elif k % 64 == 0:
         H = _v173_weight_gram_blocks(wq, 64)
         st['weight_hessian_blocks'] = H.cpu().to(torch.bfloat16)
-    st['version'] = 'v174_dynamic_hessian_fallback'
+    st['version'] = 'full_hessian_up_to_2048'
     return {'weight_params': p, 'activation_state': st}
 
-def _v181b_pairblock_refine(y, p, H, iters=20, block_batch=4):
-    if y.dim() != 2 or int(y.shape[-1]) != 2048:
+def _refine_full_hessian_batched(y, p, H, iters=20, block_batch=4):
+    if y.dim() != 2 or int(y.shape[-1]) % 64 != 0:
         return p
     rows = int(y.shape[0])
-    nb = 32
+    k = int(y.shape[-1])
+    nb = k // 64
+    if not isinstance(H, torch.Tensor) or H.numel() != k * k:
+        return p
     pp = _v64_clone_params(p)
     sf = pp['scale_factor'].float().reshape(rows, nb, 1, 1, 1)
     l2 = pp['scale_lv2'].float().reshape(rows, nb, 8, 1, 1)
     l3 = pp['scale_lv3'].float().reshape(rows, nb, 8, 2, 1)
-    eff = (sf * l2 * l3).expand(rows, nb, 8, 2, 4).reshape(rows, 2048)
-    u = (pp['sign'].float() * pp['mant'].float()).reshape(rows, 2048)
-    yy = y.float().reshape(rows, 2048)
-    HH = H.to(y.device, torch.float32).reshape(2048, 2048)
+    eff = (sf * l2 * l3).expand(rows, nb, 8, 2, 4).reshape(rows, k)
+    u = (pp['sign'].float() * pp['mant'].float()).reshape(rows, k)
+    yy = y.float().reshape(rows, k)
+    HH = H.to(y.device, torch.float32).reshape(k, k)
     g = (u * eff - yy).matmul(HH)
     step = 0.25 * eff
-    step2 = step.square() * HH.diagonal().reshape(1, 2048)
-    batch = int(block_batch)
+    step2 = step.square() * HH.diagonal().reshape(1, k)
+    batch = max(1, int(block_batch))
     for _ in range(int(iters)):
         for block0 in range(0, nb, batch):
+            block_count = min(batch, nb - block0)
             lo = block0 * 64
-            hi = lo + batch * 64
+            hi = lo + block_count * 64
             base = 2.0 * step[:, lo:hi] * g[:, lo:hi]
-            dp = (base + step2[:, lo:hi]).reshape(rows, batch, 64)
-            dm = (-base + step2[:, lo:hi]).reshape(rows, batch, 64)
-            ub = u[:, lo:hi].reshape(rows, batch, 64)
+            dp = (base + step2[:, lo:hi]).reshape(rows, block_count, 64)
+            dm = (-base + step2[:, lo:hi]).reshape(rows, block_count, 64)
+            ub = u[:, lo:hi].reshape(rows, block_count, 64)
             dp.masked_fill_(ub >= 1.75 - 1e-06, float('inf'))
             dm.masked_fill_(ub <= -1.75 + 1e-06, float('inf'))
             plus = dp < dm
@@ -1609,7 +1613,7 @@ def _v181b_pairblock_refine(y, p, H, iters=20, block_batch=4):
             good = best < -1e-08
             direction = torch.where(plus.gather(2, j0.unsqueeze(-1)).squeeze(-1), torch.ones_like(best), -torch.ones_like(best))
             du = 0.25 * direction * good
-            offsets = (lo + torch.arange(batch, device=y.device) * 64).reshape(1, batch)
+            offsets = (lo + torch.arange(block_count, device=y.device) * 64).reshape(1, block_count)
             j = j0 + offsets
             u.scatter_add_(1, j, du)
             de = du * eff.gather(1, j)
@@ -1628,9 +1632,11 @@ def hif4_dynamic_quantize_activation(aq, asc, st):
     if isinstance(post, torch.Tensor):
         y = y.index_select(-1, post.to(y.device, dtype=torch.long))
     p = _quantize_tensor_self_mse(y, return_dequant=False)[0]
-    H = st.get('full2048_hessian')
+    H = st.get('full_hessian')
+    if not isinstance(H, torch.Tensor):
+        H = st.get('full2048_hessian')
     if isinstance(H, torch.Tensor):
-        p = _v181b_pairblock_refine(
+        p = _refine_full_hessian_batched(
             y, p, H.to(y.device, torch.float32), 10, block_batch=4,
         )
     elif isinstance(st.get('super1024_hessian_blocks'), torch.Tensor):
