@@ -30,6 +30,7 @@ uv run python self_check_.py --solution_dir solution_collection/solution
 | `v168_` | 7/12 | `1.64980e-3` | `4.51886e-4` | `1.05084e-3` | `2705.60 ms` | `670.33 ms` |
 | `v169_` | 7/12 | `1.64686e-3` | `4.51886e-4` | `1.04937e-3` | `2473.78 ms` | `699.84 ms` |
 | `v170_` | 7/12 | `1.64686e-3` | `3.98754e-4` | `1.02281e-3` | `2648.22 ms` | `1120.25 ms` |
+| `v171_` | 7/12 | `1.64686e-3` | `3.98149e-4` | `1.02250e-3` | `3220.61 ms` | `1137.96 ms` |
 
 Attention 逐项结果：
 
@@ -42,8 +43,9 @@ Attention 逐项结果：
 | `v167_` | `7.8656e-4` | `4.1918e-4` | `2.7843e-4` | `2.6880e-4` | `2.5105e-4` |
 | `v168_`–`v169_` | `7.9804e-4` | `4.7382e-4` | `3.4094e-4` | `3.3432e-4` | `3.1231e-4` |
 | `v170_` | `7.7489e-4` | `4.1870e-4` | `2.7845e-4` | `2.7061e-4` | `2.5112e-4` |
+| `v171_` | `7.7125e-4` | `4.1857e-4` | `2.8147e-4` | `2.6975e-4` | `2.4970e-4` |
 
-所有版本的 5 个 Attention 样本仍全部通过阈值。`v165_` 与 `v170_` 的真实 GQA Attention 平均 MSE 最低；`v168_/v169_` 相对它们退化约 13.3%，但动态路径明显更快。当前精度优先推荐 `v170_`，低时延基线为 `v168_`；后续 Attention 优化只与本节比较。
+所有版本的 5 个 Attention 样本仍全部通过阈值。`v171_` 的真实 GQA Attention 与十项平均 MSE 最低，但相对 `v170_` 的收益仅约 0.15%，需要线上验证；低时延基线仍为 `v168_`。
 
 ## 旧版展平 fallback 版本总览
 
@@ -60,7 +62,7 @@ Attention 逐项结果：
 | `v168_` | 融合 v111 直接 per-head Attention 路径，移除 partner-Hessian | 7/12 | `1.64980e-3` | `2.58932e-4` | `9.54366e-4` | `2498.94 ms` | `669.64 ms` | `15.19 s` |
 | `v169_` | Linear 加入 block-64 cross-target 补偿（`lambda=0.25`） | 7/12 | `1.64686e-3` | `2.58932e-4` | `9.52896e-4` | `2771.01 ms` | `677.14 ms` | `16.11 s` |
 
-旧 fallback 口径当时推荐 `solution_collection/solution_v169_.py`；该推荐已被上面的真实 GQA 重测结论取代，当前 `solution.py` 为精度优先的 `v170_`。
+旧 fallback 口径当时推荐 `solution_collection/solution_v169_.py`；该推荐已被上面的真实 GQA 重测结论取代，当前 `solution.py` 为精度优先的 `v171_`。
 
 ## 逐项 MSE
 
@@ -153,6 +155,13 @@ Attention 逐项结果：
 - 十项平均 MSE 从 v169 的 `1.04937e-3` 降至 `1.02281e-3`，为当前最低。
 - 平均动态时延从约 `699.84 ms` 回升到 `1120.25 ms`，因此定位为精度优先版本，而非低时延版本。
 
+### v171_：极值稳健 signed-H64 seed2
+
+- 保留 v170 的 Linear、Smooth、partner covariance 与 refinement，只将 Q/K 共同使用的确定性 signed-H64 符号种子从 1 改为 2。
+- 同一 KV group 的 Q/K 始终共享完全相同的正交基，因此量化前 GQA logits 不变；动态步骤数没有增加。
+- calibration Attention 平均 MSE 从 `4.34315e-4` 降至 `4.33899e-4`，test 平均从 `3.98754e-4` 降至 `3.98149e-4`，最坏样本也改善。
+- 收益很小且本地仅有一个 Attention group，作为低风险实验快照保留，是否泛化必须以线上分数为准。
+
 ## 未保存实验
 
 | 实验 | 结果 | 处理 |
@@ -165,6 +174,13 @@ Attention 逐项结果：
 | K hierarchy candidate 接受阈值 | 所有长序列 candidate 的 metric 改善均远超阈值，head 选择完全不变 | 不增加无效逻辑 |
 | 用 cross-target objective 完全替换现有 Linear hierarchy | `lambda=0.25` 相对该简化路径自身略有改善，但整体明显差于 `v168_` | 保留现有 hierarchy，仅叠加补偿 |
 | cross-target 补偿仅保留对角项 | 各有效 `lambda` 均劣于完整 64x64 补偿；`lambda=0.25` 平均约 `1.66436e-3` | 放弃 |
+| 真实 GQA per-KV 独立 rotation | calibration 选择 `(seed2, seed1)`，但 test 平均约 `4.00307e-4`，差于统一 seed1/seed2 | 放弃，避免逐 head 过拟合 |
+| Q/K Smooth `beta={0,0.25,0.75}` | calibration 与 test 均由 `beta=0.5` 最优 | 保留 `beta=0.5` |
+| K MAD-clipped robust translation center | test 平均略降，但 calibration 退化且 128-token 明显变差 | 放弃，泛化信号不一致 |
+| Q/K/V tail-aware scale（top-value 加权） | Attention 平均退化到约 `4.04882e-4`，短序列最明显 | 放弃 |
+| 仅 V tail-aware scale | Attention 平均退化到约 `4.04333e-4` | 放弃 |
+| V attention-mass importance | HiF4 参数按 token/block 独立，统一 token 权重不改变该 block 的 argmin | 当前格式下不增加无效逻辑 |
+| softmax-sensitivity covariance | calibration 平均改善约 2.7%，test 平均退化到约 `4.00864e-4` | 放弃，calibration 过拟合 |
 
 ## 历史版本复用验证
 
