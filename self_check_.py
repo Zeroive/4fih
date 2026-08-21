@@ -117,18 +117,52 @@ def compute_matmul(w: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         return torch.matmul(w, a)
 
 
-def compute_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Compute Attention with fallback for dimension mismatches."""
-    if q.dim() == 2:
-        q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
-    try:
-        return torch.nn.functional.scaled_dot_product_attention(q, k, v).squeeze(0)
-    except RuntimeError:
-        min_dim = min(q.shape[-1], k.shape[-1])
-        q_proj, k_proj = q[..., :min_dim], k[..., :min_dim]
-        scores = torch.matmul(q_proj, k_proj.transpose(-1, -2)) / (min_dim ** 0.5)
-        attn_weights = torch.softmax(scores, dim=-1)
-        return torch.matmul(attn_weights, v).squeeze(0)
+def compute_attention(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        q_num_heads: int,
+        kv_num_heads: int,
+        head_dim: int,
+) -> torch.Tensor:
+    """Compute non-causal grouped-query attention from flattened 2-D Q/K/V."""
+    if q.ndim != 2 or k.ndim != 2 or v.ndim != 2:
+        raise ValueError("Q/K/V must be 2-D tensors shaped [seq_len, hidden]")
+    if q_num_heads % kv_num_heads != 0:
+        raise ValueError("q_num_heads must be divisible by kv_num_heads")
+    if not (q.shape[0] == k.shape[0] == v.shape[0]):
+        raise ValueError("Q/K/V sequence lengths must match")
+
+    seq_len = int(q.shape[0])
+    expected_q_hidden = int(q_num_heads) * int(head_dim)
+    expected_kv_hidden = int(kv_num_heads) * int(head_dim)
+    if int(q.shape[-1]) != expected_q_hidden:
+        raise ValueError(
+            f"Q hidden size {q.shape[-1]} != q_num_heads*head_dim "
+            f"{expected_q_hidden}"
+        )
+    if int(k.shape[-1]) != expected_kv_hidden or int(v.shape[-1]) != expected_kv_hidden:
+        raise ValueError(
+            f"K/V hidden size must equal kv_num_heads*head_dim {expected_kv_hidden}"
+        )
+
+    # SDPA expects [batch, heads, seq_len, head_dim]. Repeat each KV head for
+    # its contiguous group of query heads, matching standard GQA head mapping.
+    q_heads = q.reshape(seq_len, q_num_heads, head_dim).permute(1, 0, 2).unsqueeze(0)
+    k_heads = k.reshape(seq_len, kv_num_heads, head_dim).permute(1, 0, 2).unsqueeze(0)
+    v_heads = v.reshape(seq_len, kv_num_heads, head_dim).permute(1, 0, 2).unsqueeze(0)
+    queries_per_kv = q_num_heads // kv_num_heads
+    k_heads = k_heads.repeat_interleave(queries_per_kv, dim=1)
+    v_heads = v_heads.repeat_interleave(queries_per_kv, dim=1)
+
+    output = torch.nn.functional.scaled_dot_product_attention(
+        q_heads,
+        k_heads,
+        v_heads,
+        dropout_p=0.0,
+        is_causal=False,
+    )
+    return output.squeeze(0).permute(1, 0, 2).reshape(seq_len, expected_q_hidden)
 
 
 # =============================================================================
@@ -967,8 +1001,14 @@ def check_attention_group(
         mse = None
         if test_ok:
             try:
-                out_s = compute_attention(fp32_tensors["q"], fp32_tensors["k"], fp32_tensors["v"])
-                out_t = compute_attention(hif4_tensors["q"], hif4_tensors["k"], hif4_tensors["v"])
+                out_s = compute_attention(
+                    fp32_tensors["q"], fp32_tensors["k"], fp32_tensors["v"],
+                    q_num_heads, kv_num_heads, head_dim,
+                )
+                out_t = compute_attention(
+                    hif4_tensors["q"], hif4_tensors["k"], hif4_tensors["v"],
+                    q_num_heads, kv_num_heads, head_dim,
+                )
                 mse = torch.mean((out_s - out_t) ** 2).item()
                 if mse > MSE_THRESHOLD_ATTN:
                     test_ok = False

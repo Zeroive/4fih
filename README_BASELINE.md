@@ -13,8 +13,19 @@ uv run python self_check_.py --solution_dir solution_collection/solution
 - Attention 通过阈值：MSE ≤ `1e-3`
 - MSE 数值用于比较算法变化；本地数据只用于调试，不用于编写样本内容特判。
 - 时延受系统负载影响，只比较明显趋势。动态路径未增加计算时，数个百分点的差异视为运行波动。
+- 2026-08-21 起，Attention checker 按 `[batch, heads, seq, head_dim]` 执行真实 GQA；更早结果来自展平 fallback，不可与新结果直接比较。
 
-## 版本总览
+## 真实 GQA 基线
+
+| 版本 | 10 tokens | 128 tokens | 512 tokens | 1024 tokens A | 1024 tokens B | Attention 平均 MSE |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `v169_` | `7.9804e-4` | `4.7382e-4` | `3.4094e-4` | `3.3432e-4` | `3.1231e-4` | `4.5189e-4` |
+
+当前真实 GQA 基线通过全部 5 个 Attention 样本。后续 Attention 优化只与本表及其新增行比较。
+
+## 旧版展平 fallback 版本总览
+
+以下历史 Attention MSE 和十项平均 MSE 使用旧 checker，仅保留用于追溯，不能代表真实 GQA 收益。
 
 | 版本 | 核心变化 | 通过数 | Linear 平均 MSE | Attention 平均 MSE | 十项平均 MSE | 平均校准时延 | 平均动态时延 | 总耗时 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -42,7 +53,7 @@ uv run python self_check_.py --solution_dir solution_collection/solution
 
 结论：8 次精修的 Linear MSE 最低，但校准时延增长过大；`v169_` 在 6 次精修基础上使五项 MSE 全部下降，动态时延仅小幅增加。
 
-### Attention
+### Attention（旧展平 fallback）
 
 | 版本 | 10 tokens | 128 tokens | 512 tokens | 1024 tokens A | 1024 tokens B |
 | --- | ---: | ---: | ---: | ---: | ---: |
