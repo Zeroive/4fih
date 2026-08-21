@@ -797,45 +797,15 @@ def _extract_hessian_64_blocks(H256):
             hs.append(H256[h,s:s+64,s:s+64])
     return torch.stack(hs,0)
 
-def _shrink_covariance_by_sample_reliability(covariances, weights):
-    """Estimate an independent off-diagonal reliability for every head."""
-    total = float(sum(weights))
-    if not covariances or total <= 0.0:
-        return None, None
-    aggregate = sum(C * float(w) for C, w in zip(covariances, weights)) / total
-    scale = aggregate.diagonal(dim1=-2, dim2=-1).mean(-1).abs().clamp_min(1e-12)
-    normalized = aggregate / scale[:, None, None]
-
-    variability = torch.zeros(
-        normalized.shape[0], device=normalized.device, dtype=torch.float32
-    )
-    for covariance, weight in zip(covariances, weights):
-        delta = covariance / scale[:, None, None] - normalized
-        off_delta = delta - torch.diag_embed(
-            delta.diagonal(dim1=-2, dim2=-1)
-        )
-        variability.add_(off_delta.square().mean((1, 2)) * float(weight))
-    variability.div_(total)
-
-    diagonal = torch.diag_embed(
-        normalized.diagonal(dim1=-2, dim2=-1)
-    )
-    off_diagonal = normalized - diagonal
-    signal = off_diagonal.square().mean((1, 2)).clamp_min(1e-12)
-    reliability = (signal / (signal + variability)).clamp(0.25, 1.0)
-    shrunk = (
-        reliability[:, None, None] * normalized
-        + (1.0 - reliability[:, None, None]) * diagonal
-    )
-    return shrunk, reliability
-
 def _compute_attention_partner_covariances(decoded,qs,ks,q_num_heads,kv_num_heads,head_dim):
     if not decoded or head_dim%64!=0:
         return None
     rep=q_num_heads//kv_num_heads
     device=decoded[0][0].device
-    q_covariances=[]; q_weights=[]
-    k_covariances=[]; k_weights=[]
+    HQ_kv=torch.zeros((kv_num_heads,head_dim,head_dim),device=device,dtype=torch.float32)
+    HK=torch.zeros((kv_num_heads,head_dim,head_dim),device=device,dtype=torch.float32)
+    nk_count=0
+    nq_count=0
 
     for q,k,_ in decoded:
         qt=_apply_query_transform(q.float(),qs,q_num_heads,head_dim).reshape(-1,q_num_heads,head_dim)
@@ -844,36 +814,28 @@ def _compute_attention_partner_covariances(decoded,qs,ks,q_num_heads,kv_num_head
         # Q logit error is insensitive to the mean of K across key positions:
         # delta_q @ K^T differs only by a row-constant along that component.
         kc=kt-kt.mean(dim=0,keepdim=True)
-        nk=max(int(kc.shape[0]),1)
-        q_covariances.append(torch.einsum('shd,she->hde',kc,kc)/float(nk))
-        q_weights.append(float(nk))
+        HQ_kv.add_(torch.einsum('shd,she->hde',kc,kc))
+        nk_count += int(kc.shape[0])
 
         # Each KV head is shared by `rep` Q heads. Aggregate all associated Q energy.
         qg=qt.reshape(qt.shape[0],kv_num_heads,rep,head_dim)
-        nq=max(int(qg.shape[0])*int(rep),1)
-        k_covariances.append(torch.einsum('shrd,shre->hde',qg,qg)/float(nq))
-        k_weights.append(float(nq))
+        HK.add_(torch.einsum('shrd,shre->hde',qg,qg))
+        nq_count += int(qg.shape[0])*int(rep)
 
-    q_total=float(sum(q_weights))
-    HQ_kv=(
-        sum(C*float(w) for C,w in zip(q_covariances,q_weights))/q_total
-        if q_covariances and q_total>0.0 else None
-    )
-    if isinstance(HQ_kv,torch.Tensor):
-        HQ_kv=_normalize_hessian_blocks(HQ_kv)
-        q_reliability=torch.ones(kv_num_heads,device=device)
-    HK,k_reliability=_shrink_covariance_by_sample_reliability(
-        k_covariances,k_weights
-    )
-    if not isinstance(HQ_kv,torch.Tensor) or not isinstance(HK,torch.Tensor):
+    if nk_count<=0 or nq_count<=0:
         return None
+    HQ_kv.div_(float(nk_count))
+    HK.div_(float(nq_count))
+
+    HQ_kv=_normalize_hessian_blocks(HQ_kv)
+    HK=_normalize_hessian_blocks(HK)
 
     # Repeat each K-head covariance for the Q heads that attend to it.
     HQ256=HQ_kv.repeat_interleave(rep,dim=0).contiguous()
     HK256=HK.contiguous()
     HQ64=_extract_hessian_64_blocks(HQ256)
     HK64=_extract_hessian_64_blocks(HK256)
-    return HQ64,HQ256,HK64,HK256,q_reliability,k_reliability
+    return HQ64,HQ256,HK64,HK256
 
 def _attach_attention_covariance_state(out,calib_qkv_list,q_num_heads,kv_num_heads,head_dim,use_q_h256=False,use_k_metric=False):
     decoded=_decode_attention_calibration(calib_qkv_list,q_num_heads,kv_num_heads,head_dim)
@@ -883,10 +845,9 @@ def _attach_attention_covariance_state(out,calib_qkv_list,q_num_heads,kv_num_hea
     cov=_compute_attention_partner_covariances(decoded,qs,ks,q_num_heads,kv_num_heads,head_dim)
     if cov is None:
         return out
-    HQ64,HQ256,HK64,HK256,q_reliability,k_reliability=cov
+    HQ64,HQ256,HK64,HK256=cov
 
     qs['partner_h64']=HQ64.detach().cpu().to(torch.bfloat16)
-    qs['partner_head_reliability']=q_reliability.detach().cpu().float()
     qs['partner_cov_enabled']=True
     qs['partner_h256_enabled']=bool(use_q_h256)
     if use_q_h256:
@@ -898,7 +859,6 @@ def _attach_attention_covariance_state(out,calib_qkv_list,q_num_heads,kv_num_hea
         # scale-selection ablations without changing the state contract.
         ks['partner_h256']=HK256.detach().cpu().to(torch.bfloat16)
         ks['partner_h64']=HK64.detach().cpu().to(torch.bfloat16)
-        ks['partner_head_reliability']=k_reliability.detach().cpu().float()
 
     out=dict(out)
     out['q_state']=qs
@@ -1327,11 +1287,6 @@ def _quantize_dynamic_key(k_quant,k_scale,kv_num_heads,head_dim,k_state,lv3_iter
     H256d=H256.to(x.device,torch.float32)
     # Exact V113 quotient baseline.
     p0=_quantize_key_with_partner_metric(x,H256d,kv_num_heads,head_dim)
-    # For short sequences, the quotient solution is already well constrained;
-    # skip the extra hierarchy repair whose quadratic proxy is less reliable in
-    # the strongly nonlinear, low-token softmax regime.
-    if int(x.shape[-2]) <= _FULL_KEY_SEARCH_MAX_SEQUENCE:
-        return p0
     q0=_dequantize_hif4_params(p0,tuple(x.shape)).float()
     # The optimal common translation per feature is invisible to softmax.
     c=(x-q0).mean(dim=-2,keepdim=True)
@@ -1755,11 +1710,12 @@ def hif4_calibration_attention(
     head_dim,
 ):
     """
-    Low-latency attention calibration:
+    V162:
       1. decode calibration Q/K/V
-      2. apply beta=0.5 reciprocal Smooth
-      3. use the robust signed-H64 transform for every head
-      4. attach partner covariance state
+      2. keep V113 beta=0.5 reciprocal Smooth
+      3. select rotation independently per KV head
+      4. attach V113 partner covariance state
+      5. dynamic quantization remains V159
     """
 
     decoded = _decode_attention_calibration(
@@ -1841,11 +1797,20 @@ def hif4_calibration_attention(
         0.5,
     )
 
-    # The calibration reconstruction proxy favored identity on this workload,
-    # while the fixed signed-H64 transform is consistently better end-to-end
-    # and avoids the expensive per-head candidate search.
-    q_patterns = torch.ones(q_num_heads, dtype=torch.long)
-    k_patterns = torch.ones(kv_num_heads, dtype=torch.long)
+    # ---------------------------------------------------------
+    # NEW V162:
+    # choose rotation independently per KV head.
+    # ---------------------------------------------------------
+    q_patterns, k_patterns = (
+        _choose_head_rotation_patterns(
+            decoded,
+            q_num_heads,
+            kv_num_heads,
+            head_dim,
+            sq,
+            sk,
+        )
+    )
 
     common = {
         "version": _ATTENTION_STATE_VERSION,
