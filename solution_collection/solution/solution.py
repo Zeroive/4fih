@@ -1558,23 +1558,31 @@ def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activ
     if isinstance(HA1024, torch.Tensor):
         p = _v174_chunk_weight(wt, p, HA1024, 1024, 128, 2)
     wq = _v64_dequant_params(p, tuple((int(s) for s in weight_quant.shape))).float()
-    for key in ('weight_hessian_blocks', 'super256_hessian_blocks', 'super512_hessian_blocks', 'super1024_hessian_blocks', 'cross1024_hessian_blocks', 'full_hessian', 'full2048_hessian'):
+    # Final public activation metric uses one representation for every width:
+    #   hessian_blocks.shape == [num_groups, group, group]
+    # A full Hessian is simply num_groups=1 and group=k.  Larger widths fall
+    # back to 1024/256/64 block-diagonal metrics without changing state format.
+    for key in (
+        'weight_hessian_blocks', 'super256_hessian_blocks',
+        'super512_hessian_blocks', 'super1024_hessian_blocks',
+        'cross1024_hessian_blocks', 'full_hessian', 'hessian_blocks',
+    ):
         st.pop(key, None)
     k = int(wq.shape[-1])
+    Hblocks = None
     if k <= 2048 and k % 64 == 0:
         H = wq.t().matmul(wq)
         scale = H.diagonal().mean().abs().clamp_min(1e-12)
-        st['full_hessian'] = (H / scale).cpu().to(torch.bfloat16)
+        Hblocks = (H / scale).unsqueeze(0)  # [1, k, k] == full-H
     elif k % 1024 == 0:
-        H = _v173_weight_gram_blocks(wq, 1024)
-        st['super1024_hessian_blocks'] = H.cpu().to(torch.bfloat16)
+        Hblocks = _v173_weight_gram_blocks(wq, 1024)
     elif k % 256 == 0:
-        H = _v173_weight_gram_blocks(wq, 256)
-        st['super256_hessian_blocks'] = H.cpu().to(torch.bfloat16)
+        Hblocks = _v173_weight_gram_blocks(wq, 256)
     elif k % 64 == 0:
-        H = _v173_weight_gram_blocks(wq, 64)
-        st['weight_hessian_blocks'] = H.cpu().to(torch.bfloat16)
-    st['version'] = 'full_hessian_up_to_2048'
+        Hblocks = _v173_weight_gram_blocks(wq, 64)
+    if isinstance(Hblocks, torch.Tensor):
+        st['hessian_blocks'] = Hblocks.cpu().to(torch.bfloat16)
+    st['version'] = 'unified_hessian_blocks'
     return {'weight_params': p, 'activation_state': st}
 
 def _refine_full_hessian_batched(y, p, H, iters=20, block_batch=4):
@@ -1625,6 +1633,288 @@ def _refine_full_hessian_batched(y, p, H, iters=20, block_batch=4):
     pp['sign'] = sg.reshape_as(pp['sign']).to(torch.bfloat16)
     return pp
 
+
+def _full_hierarchy_init(y, p, H):
+    """Initialize the shared full-H hierarchy state q and g=(q-y)@H once."""
+    if y.dim() != 2 or int(y.shape[-1]) % 64 != 0:
+        return None
+    rows = int(y.shape[0])
+    k = int(y.shape[-1])
+    if not isinstance(H, torch.Tensor) or H.numel() != k * k:
+        return None
+    pp = _v64_clone_params(p)
+    HH = H.to(y.device, torch.float32).reshape(k, k)
+    yy = y.float().reshape(rows, k)
+    q = _v64_dequant_params(pp, tuple((int(s) for s in y.shape))).float().reshape(rows, k)
+    g = (q - yy).matmul(HH)
+    return pp, q, g
+
+
+def _refine_full_scale_once(y, p, H, q=None, g=None):
+    """
+    One exact full-H scale_factor sweep.
+
+    A scale candidate only changes one 64-value block S. Candidate scoring uses
+        dL = 2 d^T g_S + d^T H_SS d,
+    and an accepted candidate updates the shared global gradient with
+        g <- g + d^T H_{S,:}.
+    No full objective is recomputed per candidate.
+    """
+    if y.dim() != 2 or int(y.shape[-1]) % 64 != 0:
+        return p, q, g
+    rows = int(y.shape[0])
+    k = int(y.shape[-1])
+    nb = k // 64
+    if not isinstance(H, torch.Tensor) or H.numel() != k * k:
+        return p, q, g
+
+    pp = _v64_clone_params(p)
+    HH = H.to(y.device, torch.float32).reshape(k, k)
+    yy = y.float().reshape(rows, k)
+    if q is None:
+        q = _v64_dequant_params(pp, tuple((int(s) for s in y.shape))).float().reshape(rows, k)
+    if g is None:
+        g = (q - yy).matmul(HH)
+
+    table = _build_e6m2_table(y.device)
+    last = int(table.numel() - 1)
+    sfv = pp['scale_factor'].float().reshape(rows, nb)
+    l2v = pp['scale_lv2'].float().reshape(rows, nb, 8)
+    l3v = pp['scale_lv3'].float().reshape(rows, nb, 8, 2)
+    sgv = pp['sign'].float().reshape(rows, nb, 8, 2, 4)
+    mav = pp['mant'].float().reshape(rows, nb, 8, 2, 4)
+
+    for b in range(nb):
+        lo = b * 64
+        hi = lo + 64
+        z = yy[:, lo:hi].reshape(rows, 8, 2, 4)
+        qcur = q[:, lo:hi]
+        gcur = g[:, lo:hi]
+        Hss = HH[lo:hi, lo:hi]
+
+        sfcur = sfv[:, b].clamp_min(2.0 ** (-48))
+        c = qcur / sfcur[:, None]
+        den = torch.einsum('ri,ij,rj->r', c, Hss, c).clamp_min(1e-20)
+        num = (c * gcur).sum(-1)
+        sfstar = (sfcur - num / den).clamp(min=2.0 ** (-48), max=49152.0)
+        curidx = _nearest_e6m2_index(sfcur, table)
+        optidx = _nearest_e6m2_index(sfstar, table)
+        idxs = (
+            curidx,
+            (curidx - 1).clamp(0, last),
+            (curidx + 1).clamp(0, last),
+            (optidx - 1).clamp(0, last),
+            optidx,
+            (optidx + 1).clamp(0, last),
+        )
+
+        l2 = l2v[:, b].reshape(rows, 8, 1, 1)
+        l3 = l3v[:, b].reshape(rows, 8, 2, 1)
+        sg0 = torch.sign(z)
+        costs = [torch.zeros(rows, device=y.device, dtype=torch.float32)]
+        qlist = [qcur]
+        packs = [None]
+        for idx in idxs:
+            sfc = table[idx]
+            eff = sfc[:, None, None, None] * l2 * l3
+            ma = (torch.round(z.abs() / eff.clamp_min(2.0 ** (-48)) * 4.0) * 0.25).clamp(0.0, 1.75)
+            sg = torch.where(ma == 0.0, torch.zeros_like(sg0), sg0)
+            qc = (sg * ma * eff).reshape(rows, 64)
+            d = qc - qcur
+            dc = 2.0 * (d * gcur).sum(-1) + torch.einsum('ri,ij,rj->r', d, Hss, d)
+            costs.append(dc)
+            qlist.append(qc)
+            packs.append((sfc, sg, ma))
+
+        choice = torch.stack(costs, dim=0).argmin(0)
+        qstack = torch.stack(qlist, dim=1)
+        qnew = qstack.gather(1, choice[:, None, None].expand(rows, 1, 64)).squeeze(1)
+        d = qnew - qcur
+        good = choice != 0
+        if bool(good.any()):
+            q[:, lo:hi] = qnew
+            g.add_(d.matmul(HH[lo:hi, :]))
+            for ci in range(1, len(packs)):
+                mask = choice == ci
+                if not bool(mask.any()):
+                    continue
+                sfc, sg, ma = packs[ci]
+                sfv[mask, b] = sfc[mask]
+                sgv[mask, b] = sg[mask]
+                mav[mask, b] = ma[mask]
+
+    pp['scale_factor'] = sfv.reshape_as(pp['scale_factor']).to(torch.bfloat16)
+    pp['scale_lv2'] = l2v.reshape_as(pp['scale_lv2']).to(torch.bfloat16)
+    pp['scale_lv3'] = l3v.reshape_as(pp['scale_lv3']).to(torch.bfloat16)
+    pp['sign'] = sgv.reshape_as(pp['sign']).to(torch.bfloat16)
+    pp['mant'] = mav.reshape_as(pp['mant']).to(torch.bfloat16)
+    return pp, q, g
+
+
+def _refine_full_lv3_once(y, p, H, q=None, g=None):
+    """
+    One strict-sequential full-H lv3 pass (64-block batch size = 1).
+
+    For each 64-value block, evaluate its 16 possible lv3 toggles using only
+    the exact local 4x4 H_SS terms. Accept at most one improving toggle per row
+    in that block, immediately update
+        g <- g + d^T H_{S,:},
+    and only then move to the next 64 block. Therefore candidate decisions for
+    different 64 blocks never share a stale gradient and no simultaneous
+    cross-block term is omitted.
+    """
+    if y.dim() != 2 or int(y.shape[-1]) % 64 != 0:
+        return p, q, g
+    rows = int(y.shape[0])
+    k = int(y.shape[-1])
+    nb = k // 64
+    if not isinstance(H, torch.Tensor) or H.numel() != k * k:
+        return p, q, g
+
+    pp = _v64_clone_params(p)
+    HH = H.to(y.device, torch.float32).reshape(k, k)
+    yy = y.float().reshape(rows, k)
+    if q is None:
+        q = _v64_dequant_params(pp, tuple((int(s) for s in y.shape))).float().reshape(rows, k)
+    if g is None:
+        g = (q - yy).matmul(HH)
+
+    sfv = pp['scale_factor'].float().reshape(rows, nb)
+    l2v = pp['scale_lv2'].float().reshape(rows, nb * 8)
+    l3v = pp['scale_lv3'].float().reshape(rows, nb * 16)
+    sgv = pp['sign'].float().reshape(rows, nb * 16, 4)
+    mav = pp['mant'].float().reshape(rows, nb * 16, 4)
+    sf4 = sfv.repeat_interleave(16, dim=1)
+    l24 = l2v.repeat_interleave(2, dim=1)
+    ridx = torch.arange(rows, device=y.device)
+
+    # Strict block_batch=1: finish candidate selection and the global-gradient
+    # update for this 64 block before evaluating any candidate in the next one.
+    for b in range(nb):
+        lo = b * 64
+        hi = lo + 64
+        c0 = b * 16
+        c1 = c0 + 16
+        z4 = yy[:, lo:hi].reshape(rows, 16, 4)
+        q4 = q[:, lo:hi].reshape(rows, 16, 4)
+        g4 = g[:, lo:hi].reshape(rows, 16, 4)
+        cur = l3v[:, c0:c1]
+        new = torch.where(cur > 1.5, torch.ones_like(cur), torch.full_like(cur, 2.0))
+        eff = sf4[:, c0:c1] * l24[:, c0:c1] * new
+        ma = (torch.round(z4.abs() / eff[:, :, None].clamp_min(2.0 ** (-48)) * 4.0) * 0.25).clamp(0.0, 1.75)
+        sg = torch.where(ma == 0.0, torch.zeros_like(z4), torch.sign(z4))
+        qn = sg * ma * eff[:, :, None]
+        d = qn - q4
+
+        H64 = HH[lo:hi, lo:hi]
+        H4 = torch.stack([H64[i * 4:(i + 1) * 4, i * 4:(i + 1) * 4] for i in range(16)], dim=0)
+        delta = 2.0 * (d * g4).sum(-1) + torch.einsum('rbi,bij,rbj->rb', d, H4, d)
+        best, idx = delta.min(dim=1)
+        good = best < -1e-08
+        if not bool(good.any()):
+            continue
+
+        rr = ridx[good]
+        ii = idx[good]
+        glob = c0 + ii
+        q4[rr, ii] = qn[rr, ii]
+        l3v[rr, glob] = new[rr, ii]
+        mav[rr, glob] = ma[rr, ii]
+        sgv[rr, glob] = sg[rr, ii]
+
+        # Rows are independent objectives; different rows may choose different
+        # 4-value coordinates. Group only by coordinate for the H[S,:] update.
+        for gi in range(16):
+            mask = good & (idx == gi)
+            if bool(mask.any()):
+                s0 = lo + gi * 4
+                g[mask] = g[mask] + d[mask, gi].matmul(HH[s0:s0 + 4, :])
+
+    pp['scale_lv3'] = l3v.reshape_as(pp['scale_lv3']).to(torch.bfloat16)
+    pp['sign'] = sgv.reshape_as(pp['sign']).to(torch.bfloat16)
+    pp['mant'] = mav.reshape_as(pp['mant']).to(torch.bfloat16)
+    return pp, q, g
+
+
+def _refine_full_lv2_once(y, p, H, q=None, g=None):
+    """
+    One strict-sequential full-H lv2 pass (64-block batch size = 1).
+
+    For each 64-value block, evaluate its 8 possible lv2 toggles using only
+    the exact local 8x8 H_SS terms. Accept at most one improving toggle per row
+    in that block, immediately update the global gradient with H[S,:], and only
+    then evaluate the next 64 block.
+    """
+    if y.dim() != 2 or int(y.shape[-1]) % 64 != 0:
+        return p, q, g
+    rows = int(y.shape[0])
+    k = int(y.shape[-1])
+    nb = k // 64
+    if not isinstance(H, torch.Tensor) or H.numel() != k * k:
+        return p, q, g
+
+    pp = _v64_clone_params(p)
+    HH = H.to(y.device, torch.float32).reshape(k, k)
+    yy = y.float().reshape(rows, k)
+    if q is None:
+        q = _v64_dequant_params(pp, tuple((int(s) for s in y.shape))).float().reshape(rows, k)
+    if g is None:
+        g = (q - yy).matmul(HH)
+
+    sfv = pp['scale_factor'].float().reshape(rows, nb)
+    l2v = pp['scale_lv2'].float().reshape(rows, nb * 8)
+    l3v = pp['scale_lv3'].float().reshape(rows, nb * 8, 2)
+    sgv = pp['sign'].float().reshape(rows, nb * 8, 8)
+    mav = pp['mant'].float().reshape(rows, nb * 8, 8)
+    sf8 = sfv.repeat_interleave(8, dim=1)
+    ridx = torch.arange(rows, device=y.device)
+
+    # Strict block_batch=1 for hierarchy moves.
+    for b in range(nb):
+        lo = b * 64
+        hi = lo + 64
+        c0 = b * 8
+        c1 = c0 + 8
+        z8 = yy[:, lo:hi].reshape(rows, 8, 2, 4)
+        q8 = q[:, lo:hi].reshape(rows, 8, 8)
+        g8 = g[:, lo:hi].reshape(rows, 8, 8)
+        cur = l2v[:, c0:c1]
+        new = torch.where(cur > 1.5, torch.ones_like(cur), torch.full_like(cur, 2.0))
+        eff = sf8[:, c0:c1, None, None] * new[:, :, None, None] * l3v[:, c0:c1, :, None]
+        ma = (torch.round(z8.abs() / eff.clamp_min(2.0 ** (-48)) * 4.0) * 0.25).clamp(0.0, 1.75)
+        sg = torch.where(ma == 0.0, torch.zeros_like(z8), torch.sign(z8))
+        qn = (sg * ma * eff).reshape(rows, 8, 8)
+        d = qn - q8
+
+        H64 = HH[lo:hi, lo:hi]
+        H8 = torch.stack([H64[i * 8:(i + 1) * 8, i * 8:(i + 1) * 8] for i in range(8)], dim=0)
+        delta = 2.0 * (d * g8).sum(-1) + torch.einsum('rbi,bij,rbj->rb', d, H8, d)
+        best, idx = delta.min(dim=1)
+        good = best < -1e-08
+        if not bool(good.any()):
+            continue
+
+        rr = ridx[good]
+        ii = idx[good]
+        glob = c0 + ii
+        q8[rr, ii] = qn[rr, ii]
+        l2v[rr, glob] = new[rr, ii]
+        ma8 = ma.reshape(rows, 8, 8)
+        sg8 = sg.reshape(rows, 8, 8)
+        mav[rr, glob] = ma8[rr, ii]
+        sgv[rr, glob] = sg8[rr, ii]
+
+        for gi in range(8):
+            mask = good & (idx == gi)
+            if bool(mask.any()):
+                s0 = lo + gi * 8
+                g[mask] = g[mask] + d[mask, gi].matmul(HH[s0:s0 + 8, :])
+
+    pp['scale_lv2'] = l2v.reshape_as(pp['scale_lv2']).to(torch.bfloat16)
+    pp['sign'] = sgv.reshape_as(pp['sign']).to(torch.bfloat16)
+    pp['mant'] = mav.reshape_as(pp['mant']).to(torch.bfloat16)
+    return pp, q, g
+
 def hif4_dynamic_quantize_activation(aq, asc, st):
     st = st if isinstance(st, dict) else {}
     y = _safe90_decode_transform_activation(aq, asc, st)
@@ -1632,17 +1922,28 @@ def hif4_dynamic_quantize_activation(aq, asc, st):
     if isinstance(post, torch.Tensor):
         y = y.index_select(-1, post.to(y.device, dtype=torch.long))
     p = _quantize_tensor_self_mse(y, return_dequant=False)[0]
-    H = st.get('full_hessian')
-    if not isinstance(H, torch.Tensor):
-        H = st.get('full2048_hessian')
-    if isinstance(H, torch.Tensor):
-        p = _refine_full_hessian_batched(
-            y, p, H.to(y.device, torch.float32), 10, block_batch=4,
-        )
-    elif isinstance(st.get('super1024_hessian_blocks'), torch.Tensor):
-        p = _v173_refine_group(y, p, st['super1024_hessian_blocks'].to(y.device, torch.float32), 1024, 10)
-    elif isinstance(st.get('super256_hessian_blocks'), torch.Tensor):
-        p = _v173_refine_group(y, p, st['super256_hessian_blocks'].to(y.device, torch.float32), 256, 10)
-    elif isinstance(st.get('weight_hessian_blocks'), torch.Tensor):
-        p = _v173_refine_group(y, p, st['weight_hessian_blocks'].to(y.device, torch.float32), 64, 10)
+    Hblocks = st.get('hessian_blocks')
+    if isinstance(Hblocks, torch.Tensor):
+        HB = Hblocks.to(y.device, torch.float32)
+        k = int(y.shape[-1])
+        if HB.dim() == 3:
+            group = int(HB.shape[-1])
+            ng = k // group if group > 0 and k % group == 0 else -1
+            if tuple(HB.shape) == (ng, group, group):
+                if ng == 1:
+                    # Full-H: same state format as block metrics, but use the
+                    # exact global-gradient mantissa + hierarchy refinements.
+                    HH = HB[0]
+                    p = _refine_full_hessian_batched(
+                        y, p, HH, 10, block_batch=4,
+                    )
+                    full_state = _full_hierarchy_init(y, p, HH)
+                    if full_state is not None:
+                        p, q_full, g_full = full_state
+                        p, q_full, g_full = _refine_full_scale_once(y, p, HH, q_full, g_full)
+                        p, q_full, g_full = _refine_full_lv3_once(y, p, HH, q_full, g_full)
+                        p, q_full, g_full = _refine_full_lv2_once(y, p, HH, q_full, g_full)
+                else:
+                    # Block-diagonal fallback: 1024/256/64 all use this path.
+                    p = _v173_refine_group(y, p, HB, group, 10)
     return p
