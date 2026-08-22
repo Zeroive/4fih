@@ -227,11 +227,19 @@ Attention 逐项结果：
 
 ### 当前 solution.py：Attention Hessian 按真实 head_dim 泛化
 
-- 移除 Attention scale refinement 中固定的 `256` group：calibration state 改为保存通用 `partner_hessian`，其 Q/K 形状分别为 `[q_num_heads, head_dim, head_dim]` 和 `[kv_num_heads, head_dim, head_dim]`；H64 初始化块数动态使用 `head_dim/64`。
+- 移除 Attention scale refinement 中固定的 `256` group：calibration state 改为保存通用 `partner_hessian`，其 Q/K 形状分别为 `[q_num_heads, head_dim, head_dim]` 和 `[kv_num_heads, head_dim, head_dim]`。
 - `_refine_attention_scales` 根据 state 中 Hessian 的真实宽度推导 `head_width`、head 数和每 head 的 64-block 数，不再假设每个 head 恰好包含4个 H64 block。
-- 合成测试已覆盖 `head_dim=64/128/256/512`，均成功完成 calibration 和动态 Q/K 量化；例如 `head_dim=512, kv_heads=2` 保存 `[2,512,512]` K Hessian 并拆为16个 H64 block。
+- 合成测试已覆盖 `head_dim=64/128/256/512`，均成功完成 calibration 和动态 Q/K 量化；例如 `head_dim=512, kv_heads=2` 保存 `[2,512,512]` K Hessian。
 - 本地真实 `head_dim=256` checker 的十项 MSE逐项与 v175 一致，仍为 `9/12`；平均 calibration/dynamic 为 `7788.92/1368.89 ms`、总耗时 `33.64 s`。动态步骤数没有增加，时延差异按 CPU 波动处理。
 - 当前实现要求 `head_dim` 为64的倍数，使 HiF4 的64元素 block 与 head 边界对齐；非64倍数需要额外 padding/permutation 设计，不能直接按当前参数布局表达独立 per-head Hessian。
+
+### v176_：Attention Full-H 初始化
+
+- 将 Q 和 K 中心化候选从“按 H64 独立选择 E6M2 初值，再用 full-head Hessian 调 scale”改为“Self-MSE 物化合法参数、逐 head full-H mantissa 坐标初始化、同一 full-H scale refinement”。mantissa 更新的梯度包含同一 head 内全部通道相关性。
+- 删除不再使用的 `_v37_quantize_hessian`、H64 Hessian 拆分逻辑和 Q/K state 中的 `partner_h64`；Attention state 只保存真实 `[num_heads, head_dim, head_dim]` 的 `partner_hessian`，减少冗余 state 和初始化候选搜索。
+- Attention 五项 MSE 从 `7.6906e-4 / 4.5506e-4 / 3.1220e-4 / 3.0811e-4 / 2.8484e-4` 改善为 `7.7307e-4 / 4.3115e-4 / 2.9642e-4 / 2.9037e-4 / 2.6766e-4`，平均从 `4.25854e-4` 降至 `4.11734e-4`，改善约3.32%。10-token 样本轻微退化约0.52%，其余四项均改善。
+- Linear 五项逐项不变，完整 checker 保持 `9/12`。清理后复测平均 calibration/dynamic 为 `8534.89/1447.28 ms`、总耗时 `35.66 s`；与此前运行的 CPU 波动区间相当，没有观察到明确时延增加。
+- 合成验证覆盖 `head_dim=64/128/256/512` 的 full-H mantissa 初始化。改善版本保存为 `solution_collection/solution_v176_.py`，并保留在当前 `solution.py`。
 
 ## 未保存实验
 
@@ -255,6 +263,7 @@ Attention 逐项结果：
 | E6M2 anchor 向下扩展到 `-2/-4/-8` | 三组真实 GQA 的十项 MSE 均与 v171 一致；最激进 `-8..+4` 的 Linear/Attention 平均仍为 `1.64686e-3` / `3.98148e-4`。对变换后 test Q/K/V 的 base-SSE 逐 block 统计中，`<-1` 被选次数均为 0（Q 172672 blocks，K/V 各 21584 blocks） | 放弃；额外低 scale 候选无端到端收益 |
 | Attention 两轮 permutation | 第一轮按 robust outlier score 分组后 test 平均 `4.00243e-4`；第二轮按 Hessian-weighted residual 集中分组为 `4.02958e-4`，跨 block 均衡为 `4.01525e-4`，均差于 v171 的 `3.98149e-4`；两轮版 calibration 约 `6.9–11.3 s` | 实验实现保留，不合入 solution；存在 calibration 过拟合且开销过大 |
 | `solution_tmp.py` 动态 Linear 移除小块 Hessian | 完整 H64+H256 平均 `1.24839e-3`；仅去 H64 为 `1.24224e-3`；仅去 H256 为 `1.24924e-3`；同时去 H64/H256 最佳，为 `1.23598e-3`。离线 Weight 参数保持相同，只消融 activation state/动态路径 | 小块目标与 H1024/H2048 存在冲突；值得形成 tmp 精简版后串行复测时延 |
+| Linear `full-H2048 -> H64` 后处理 | 在当前 full-H2048 mantissa + scale/lv3/lv2 完整 refinement 后，额外按 full Hessian 的 64×64 对角块执行1轮 mantissa refinement。Linear 五项从 `2.0117e-3 / 1.4517e-3 / 1.0111e-3 / 9.2490e-4 / 9.4106e-4` 退化为 `2.1304e-3 / 1.7093e-3 / 1.2789e-3 / 1.2153e-3 / 1.1955e-3`，平均从 `1.26809e-3` 升至 `1.50588e-3`，退化约18.75%；通过数由9/12降至7/12 | 放弃并恢复；H64 忽略跨 block 项，局部接受的更新会破坏已经优化好的 full-H2048 全局目标 |
 | Linear `H64 -> global permute -> H64` | 关闭 H1024/H2048 时，固定 perfect-shuffle 平均 MSE `2.48232e-3`、数据驱动 pressure-balanced permutation 为 `2.50572e-3`，Linear 动态均约 `121–129 ms`；恢复与 v172 相同的 H1024 + 8轮 H2048 后，数据驱动版平均 `1.49348e-3`、动态约 `793.66 ms`，仍比 v172 的 `1.30276e-3` 退化约14.6%，且 Linear calibration 增至约 `15.29 s` | 放弃；第二层 H64 使第一层形成的量化友好局部结构和 covariance 分块重新变密，额外 refinement 只能部分追回精度 |
 | Linear normalized Gram `Diagonal + Low-rank` | 以量化权重 `Wq` 的随机 SVD 构造 `D + BB^T`，替换动态 H1024/full-H2048，均使用8轮 refinement。rank-32/64/128 的 Linear 平均 MSE分别为 `1.64958e-3` / `1.60632e-3` / `1.55216e-3`，state 约 `132/260/516 KiB`；rank-128 仍比 v172 的 `1.30276e-3` 退化约19.1%。各次原始 Linear 动态均值约 `274–438 ms`，明显低于 full-H2048 的受控约 `817.79 ms`，但 CPU负载波动较大；随机低秩分解使 Linear calibration 约为 `14.3–15.5 s` | 不合入精度优先主线；权重 Gram 的谱不够低秩，适合作为低内存/低时延分支，而不能无损替代 full-H2048 |
 | full-Hessian refinement 32轮 | Linear 五项为 `1.8303e-3 / 1.4319e-3 / 1.0342e-3 / 9.5436e-4 / 9.6453e-4`，平均 `1.24306e-3`，相对10轮的 `1.30202e-3` 改善约 `4.53%`；通过数从 `7/12` 提升到 `9/12`。相邻运行 Linear 动态均值从约 `1053 ms` 增至 `2839 ms`，约为 `2.70×`；整轮平均动态时延从 `1461.41 ms` 增至 `2451.19 ms` | 精度有收益，但时延增长过大；恢复10轮，不保存版本 |
