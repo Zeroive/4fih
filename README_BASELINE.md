@@ -205,6 +205,26 @@ Attention 逐项结果：
 - 完整 checker 的 Linear 五项仍为 `1.9053e-3 / 1.4998e-3 / 1.0864e-3 / 1.0056e-3 / 1.0130e-3`，Attention 五项也与 v174 完全一致。该次平均 calibration/dynamic 为 `9219.11/1461.41 ms`、总耗时 `37.32 s`；由于 2048 路径新旧数值和运算结构等价，将本次时延上浮记为 CPU 负载噪声，不作为算法时延退化结论。
 - 本次是通用性和命名改进，没有本地 MSE 收益，因此不创建新的 `solution_vxxx_.py`。
 
+### 当前 solution.py：full-H Weight `chunk_rows=1024` 时延与 MSE 基准
+
+- 将离线 Weight full-H refinement 的行分块从 `128` 扩大到 `1024`；对于本地 `8192×2048` 权重，chunk 数由 `64` 降为 `8`。该参数只改变校准阶段的批处理粒度，不改变动态 activation 路径。
+- 完整 checker 为 `9/12`。Linear 五项 MSE 为 `1.9861e-3 / 1.4720e-3 / 1.0194e-3 / 9.3353e-4 / 9.4470e-4`，平均 `1.27115e-3`；Attention 五项为 `7.6906e-4 / 4.5506e-4 / 3.1220e-4 / 3.0811e-4 / 2.8484e-4`，平均 `4.25854e-4`。
+- 相对同一实现 `chunk_rows=128` 的相邻运行，Linear calibration 从 `24928.78 ms` 降至 `18509.44 ms`，约下降 `25.8%`；平均 calibration 为 `9490.43 ms`，总耗时从 `47.80 s` 降至 `42.17 s`。
+- 平均动态时延为 `1687.61 ms`。chunk 大小不参与动态量化，因此与 `128` 行基准 `1756.90 ms` 的差异视为 CPU 运行波动，不记为算法收益。
+- 该结果作为当前 `solution.py` 后续时延与 MSE 对照基准；未单独创建版本快照。
+- 随后删除 Attention 动态路径的 `_v159_dynamic_q/_v159_dynamic_k` 转发层，将 `_v158_dynamic_tensor_h256` 重命名为描述实际行为的 `_quantize_attention_tensor_hessian`，并移除已不参与计算的 `lv3_iters/base_mant_iters` 参数。完整复测十项 MSE逐项不变，仍为 `9/12`；平均 calibration/dynamic 为 `9875.73/1540.48 ms`、总耗时 `41.50 s`。此次只减少函数转发和失效参数，不减少张量计算，时延差异仍按 CPU 波动处理。
+- Coverage 精简删除旧 `_v39/_v40/_v42` Attention state/permutation 兼容链，并将 Linear geometry 固定到当前实际使用的 `mass_act + max pressure + pmax phase`，移除未选择的 permutation、RMS phase 与 geom pressure 分支。非 coverage 完整复测十项 MSE逐项不变，仍为 `9/12`；coverage 可执行语句从 `1215` 降至 `1142`、未覆盖语句从 `244` 降至 `183`，行覆盖率从 `80%` 提升到 `84%`。剩余整段未覆盖代码主要是主动保留的 K state/Hessian 缺失 fallback。
+- 继续移除全部旧 K fallback 兼容链：删除 feature-block candidate merge/score、旧短序列 translation、多轮无 Hessian K quantizer 及其常量；Q/K 动态接口现在直接消费本轮 calibration 生成的 `scale + partner_h64/h256` state。完整非 coverage 复测十项 MSE仍逐项不变，`9/12`，平均 calibration/dynamic 为 `9283.93/1470.88 ms`、总耗时 `38.01 s`。coverage 可执行语句进一步降至 `987`、未覆盖仅 `52`，覆盖率提升到 `95%`，已不存在整个函数完全未调用的情况；剩余未覆盖行都是输入尺寸、空数据和可选返回值防御分支。
+- 合并单层内部包装：将 `_safe111_attach`、`_safe111_fixed_attention_base`、`_safe108_attach_cov_state` 直接并入公开 `hif4_calibration_attention`，固定当前实际使用的 H64/H256 state，并使 calibration QKV 从重复 decode 两次降为一次；唯一调用的一行 `_safe130_q` 也内联到 scale refinement。AST 扫描后不再存在“唯一调用且函数体仅一到两条转发语句”的内部 helper。完整复测十项 MSE逐项不变，仍为 `9/12`；本次平均 calibration/dynamic 为 `9925.74/1855.21 ms`、总耗时 `43.67 s`，计时差异按 CPU 波动处理。
+
+### v175_：Linear permutation RMS mass
+
+- 将 Linear `mass_act` permutation 的通道质量从 calibration mean-absolute 改为等样本权重 RMS，即 `sqrt(mean(x²))`；严格 L2 norm 在各通道统计元素数相同时只相差公共尺度，因此 permutation 的实质变化是 L1 importance 改为更强调极值的 L2 importance。
+- Linear 五项 MSE 为 `2.0117e-3 / 1.4517e-3 / 1.0111e-3 / 9.2490e-4 / 9.4106e-4`，平均 `1.26809e-3`，相对 mean-absolute 基准 `1.27115e-3` 改善约 `0.24%`；Attention 五项逐项不变，平均仍为 `4.25854e-4`。
+- 10-token Linear 首项退化约 `1.29%`，其余四项改善，因此该版本属于平均精度收益而非逐项稳健改善；RMS 对 calibration outlier 更敏感，线上泛化需要重点验证。
+- 完整 checker 仍为 `9/12`，平均 calibration/dynamic 为 `7658.51/1478.25 ms`、总耗时 `34.68 s`。仅改变离线 permutation，动态步骤数不变；时延下降主要按 CPU 波动处理。
+- 改善版本已保存为 `solution_collection/solution_v175_.py`，并保留在当前 `solution.py`。
+
 ## 未保存实验
 
 | 实验 | 结果 | 处理 |
