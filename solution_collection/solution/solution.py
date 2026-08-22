@@ -396,19 +396,19 @@ def _safe108_norm_h(H):
     sc = H.diagonal(dim1=-2, dim2=-1).mean(-1).abs().clamp_min(1e-12)
     return H / sc[:, None, None]
 
-# 功能：从按 head 保存的 256 维 Hessian 中切出连续的 64×64 对角子块。
+# 功能：从按真实 head_dim 保存的 Hessian 中切出连续的 64×64 对角子块。
 # 说明：用于 H64 初始化量化器。
-def _safe108_h256_to_h64(H256):
+def _split_head_hessian_64(head_hessian):
     hs = []
-    nh = int(H256.shape[0])
-    hd = int(H256.shape[-1])
+    nh = int(head_hessian.shape[0])
+    hd = int(head_hessian.shape[-1])
     for h in range(nh):
         for s in range(0, hd, 64):
-            hs.append(H256[h, s:s + 64, s:s + 64])
+            hs.append(head_hessian[h, s:s + 64, s:s + 64])
     return torch.stack(hs, 0)
 
 # 功能：从校准 Q/K 构造 partner-aware 协方差：Q 的量化误差用 K covariance 衡量，K 反之。
-# 说明：同时生成 head 级 H256 和拆分后的 H64，供 attention Hessian 量化使用。
+# 说明：同时生成真实 head_dim×head_dim Hessian 和拆分后的 H64。
 def _safe108_partner_covariances(decoded, qs, ks, q_num_heads, kv_num_heads, head_dim):
     if not decoded or head_dim % 64 != 0:
         return None
@@ -433,19 +433,19 @@ def _safe108_partner_covariances(decoded, qs, ks, q_num_heads, kv_num_heads, hea
     HK.div_(float(nq_count))
     HQ_kv = _safe108_norm_h(HQ_kv)
     HK = _safe108_norm_h(HK)
-    HQ256 = HQ_kv.repeat_interleave(rep, dim=0).contiguous()
-    HK256 = HK.contiguous()
-    HQ64 = _safe108_h256_to_h64(HQ256)
-    HK64 = _safe108_h256_to_h64(HK256)
-    return (HQ64, HQ256, HK64, HK256)
+    q_head_hessian = HQ_kv.repeat_interleave(rep, dim=0).contiguous()
+    k_head_hessian = HK.contiguous()
+    q_h64 = _split_head_hessian_64(q_head_hessian)
+    k_h64 = _split_head_hessian_64(k_head_hessian)
+    return (q_h64, q_head_hessian, k_h64, k_head_hessian)
 
-# 功能：按 KV head 计算 K 量化误差在 partner H256 下的二次型分数。
+# 功能：按 KV head 计算 K 量化误差在 partner head Hessian 下的二次型分数。
 # 说明：误差会先沿序列维去均值，以匹配 K quotient/centering 搜索目标。
-def _safe108_k_head_scores(x, dq, H256, kv_num_heads, head_dim):
+def _safe108_k_head_scores(x, dq, head_hessian, kv_num_heads, head_dim):
     seq = int(x.shape[-2])
     e = (dq.float() - x.float()).reshape(seq, kv_num_heads, head_dim)
     e = e - e.mean(dim=0, keepdim=True)
-    H = H256.to(x.device, torch.float32)
+    H = head_hessian.to(x.device, torch.float32)
     return torch.einsum('shd,hde,she->h', e, H, e)
 
 # 功能：根据每个 KV head 的最佳候选编号，从多组 HiF4 参数中逐 head 合并最终参数。
@@ -468,8 +468,8 @@ def _safe108_merge_k_by_head(params_list, best_head, kv_num_heads, head_dim):
     return out
 
 # 功能：为 K 构造多组 quotient/centering 候选，并使用 Q-partner covariance 指标逐 head 选优。
-# 说明：候选本身仍由快速 Self-MSE kernel 量化，评分则使用 H256 二次型。
-def _safe108_quantize_k_partner(x, H256, kv_num_heads, head_dim):
+# 说明：候选本身仍由快速 Self-MSE kernel 量化，评分使用真实 head_dim Hessian。
+def _safe108_quantize_k_partner(x, head_hessian, kv_num_heads, head_dim):
     """
     Same fast K quotient basins as V60, but candidate selection is performed with
     centered Q-covariance metric instead of plain feature SSE.
@@ -482,9 +482,9 @@ def _safe108_quantize_k_partner(x, H256, kv_num_heads, head_dim):
     params.append(p)
     dqs.append(q)
 
-    # 功能：内部辅助：对当前所有 K 候选计算 partner-H256 分数，并逐 KV head 取最优反量化结果。
+    # 功能：内部辅助：对当前所有 K 候选计算 partner Hessian 分数，并逐 KV head 取最优反量化结果。
     def current_best():
-        scores = torch.stack([_safe108_k_head_scores(x, z, H256, kv_num_heads, head_dim) for z in dqs], 0)
+        scores = torch.stack([_safe108_k_head_scores(x, z, head_hessian, kv_num_heads, head_dim) for z in dqs], 0)
         best = scores.argmin(0)
         qs = torch.stack([z.reshape(x.shape[0], kv_num_heads, head_dim) for z in dqs], 0)
         y = qs[0].clone()
@@ -547,7 +547,7 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
         'role': 'k',
         'scale': k_scale.detach().cpu().float(),
     }
-    q_h64, q_h256, k_h64, k_h256 = _safe108_partner_covariances(
+    q_h64, q_head_hessian, k_h64, k_head_hessian = _safe108_partner_covariances(
         decoded,
         q_state,
         k_state,
@@ -557,13 +557,13 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
     )
     q_state.update({
         'partner_h64': q_h64.detach().cpu().to(torch.bfloat16),
-        'partner_h256': q_h256.detach().cpu().to(torch.bfloat16),
+        'partner_hessian': q_head_hessian.detach().cpu().to(torch.bfloat16),
         'partner_cov_enabled': True,
-        'partner_h256_enabled': True,
+        'partner_hessian_enabled': True,
     })
     k_state.update({
         'partner_h64': k_h64.detach().cpu().to(torch.bfloat16),
-        'partner_h256': k_h256.detach().cpu().to(torch.bfloat16),
+        'partner_hessian': k_head_hessian.detach().cpu().to(torch.bfloat16),
         'partner_k_metric_enabled': True,
     })
     return {
@@ -582,11 +582,11 @@ def hif4_dynamic_quantize_v(v_quant, v_scale, kv_num_heads, head_dim, v_state):
     v = dequantize_nvfp4(v_quant, v_scale).float()
     return _quantize_tensor_self_mse(v, return_dequant=False)[0]
 
-# 功能：在 H256 二次型目标下，对每个 64-block 的一级 E6M2 scale_factor 做坐标更新。
-# 说明：利用当前 gradient 推导连续最优 scale，再搜索附近合法 E6M2 档位并重算 mantissa。
-def _safe130_scale_core(y, p, H256, sweeps=1):
+# 功能：在真实 head_dim Hessian 目标下，对每个 64-block 的一级 E6M2 scale_factor 做坐标更新。
+# 说明：head_dim 可为任意 64 的倍数；利用连续最优 scale 并更新对应 head 的梯度。
+def _refine_attention_scales(y, p, head_hessian, sweeps=1):
     """
-    Exact coordinate update for E6M2 scale under the full H256 quadratic.
+    Exact coordinate update for E6M2 scale under each full head Hessian.
 
     With current q_b = s*c and gradient g_b = dL/dq_b / 2,
         Delta(s) = 2 (s-s0) c^T g_b + (s-s0)^2 c^T H_bb c.
@@ -596,20 +596,28 @@ def _safe130_scale_core(y, p, H256, sweeps=1):
     """
     shape = tuple((int(s) for s in y.shape))
     k = shape[-1]
-    if y.dim() != 2 or k % 256 != 0 or (not isinstance(H256, torch.Tensor)):
+    if y.dim() != 2 or head_hessian.dim() != 3:
+        return p
+    head_width = int(head_hessian.shape[-1])
+    if (
+        head_width % 64 != 0
+        or int(head_hessian.shape[-2]) != head_width
+        or k % head_width != 0
+    ):
         return p
     rows = int(y.shape[0])
-    ng = k // 256
+    ng = k // head_width
     nb = k // 64
-    if tuple(H256.shape) != (ng, 256, 256):
+    blocks_per_head = head_width // 64
+    if tuple(head_hessian.shape) != (ng, head_width, head_width):
         return p
     pp = _v64_clone_params(p)
-    yy = y.float().reshape(rows, ng, 256)
-    H = H256.to(y.device, torch.float32)
+    yy = y.float().reshape(rows, ng, head_width)
+    H = head_hessian.to(y.device, torch.float32)
     table = _build_e6m2_table(y.device)
     last = int(table.numel() - 1)
     for _ in range(int(sweeps)):
-        q = _v64_dequant_params(pp, shape).reshape(rows, ng, 256)
+        q = _v64_dequant_params(pp, shape).reshape(rows, ng, head_width)
         e = q - yy
         grad = torch.einsum('gij,rgi->rgj', H, e)
         sfv = pp['scale_factor'].float().reshape(rows, nb, 1, 1, 1)
@@ -617,10 +625,10 @@ def _safe130_scale_core(y, p, H256, sweeps=1):
         l3v = pp['scale_lv3'].float().reshape(rows, nb, 8, 2, 1)
         sgv = pp['sign'].float().reshape(rows, nb, 8, 2, 4)
         mav = pp['mant'].float().reshape(rows, nb, 8, 2, 4)
-        for sub in range(4):
+        for sub in range(blocks_per_head):
             lo = sub * 64
             hi = lo + 64
-            bidx = torch.arange(ng, device=y.device) * 4 + sub
+            bidx = torch.arange(ng, device=y.device) * blocks_per_head + sub
             z = yy[:, :, lo:hi]
             qcur = q[:, :, lo:hi]
             gcur = grad[:, :, lo:hi]
@@ -872,46 +880,52 @@ def _v156_linear(weight_quant, weight_scale, calib_activation_list):
 
 
 
-# 功能：Attention tensor 的 Hessian 量化封装：先用 H64 选择初始参数，再用 H256 优化共享 scale。
+# 功能：Attention tensor 的 Hessian 量化封装：先用 H64 选择初始参数，再用完整 head Hessian 优化 scale。
 # 说明：用于动态 Q，以及 K 的中心化候选。
-def _quantize_attention_tensor_hessian(y, H64, H256):
-    """Initialize with H64 and refine the shared scale against H256."""
+def _quantize_attention_tensor_hessian(y, H64, head_hessian):
+    """Initialize with H64 and refine scales against each full head Hessian."""
     p, _ = _v37_quantize_hessian(y, H64.to(y.device), return_dequant=False)
-    return _safe130_scale_core(
-        y, p, H256.to(y.device, torch.float32), sweeps=1,
+    return _refine_attention_scales(
+        y, p, head_hessian.to(y.device, torch.float32), sweeps=1,
     )
 
 
 # 功能：动态 K 量化：应用 K transform 后，同时比较 partner-aware quotient 候选与中心化 Hessian 候选。
-# 说明：最终按 KV head 的 H256 误差分数选择并合并参数。
+# 说明：最终按 KV head 的真实 head_dim Hessian 误差分数选择并合并参数。
 def hif4_dynamic_quantize_k(
     k_quant, k_scale, kv_num_heads, head_dim, k_state,
 ):
     k = dequantize_nvfp4(k_quant, k_scale).float()
     x = _apply_k_transform(k, k_state, kv_num_heads, head_dim)
-    H256 = k_state['partner_h256']
+    head_hessian = k_state['partner_hessian']
     H64 = k_state['partner_h64']
-    H256d = H256.to(x.device, torch.float32)
-    p0 = _safe108_quantize_k_partner(x, H256d, kv_num_heads, head_dim)
+    head_hessian_d = head_hessian.to(x.device, torch.float32)
+    p0 = _safe108_quantize_k_partner(
+        x, head_hessian_d, kv_num_heads, head_dim,
+    )
     q0 = _v64_dequant_params(p0, tuple(x.shape)).float()
     c = (x - q0).mean(dim=-2, keepdim=True)
     target = x - c
-    p1 = _quantize_attention_tensor_hessian(target, H64, H256d)
+    p1 = _quantize_attention_tensor_hessian(target, H64, head_hessian_d)
     q1 = _v64_dequant_params(p1, tuple(x.shape)).float()
-    s0 = _safe108_k_head_scores(x, q0, H256d, kv_num_heads, head_dim)
-    s1 = _safe108_k_head_scores(x, q1, H256d, kv_num_heads, head_dim)
+    s0 = _safe108_k_head_scores(
+        x, q0, head_hessian_d, kv_num_heads, head_dim,
+    )
+    s1 = _safe108_k_head_scores(
+        x, q1, head_hessian_d, kv_num_heads, head_dim,
+    )
     best = (s1 < s0).to(torch.long)
     return _safe108_merge_k_by_head([p0, p1], best, kv_num_heads, head_dim)
 
 
-# 功能：动态 Q 量化：应用 Q transform 后，使用 K-partner H64/H256 指标完成 Hessian-aware HiF4 量化。
+# 功能：动态 Q 量化：应用 Q transform 后，使用 K-partner H64/full-head Hessian 完成量化。
 def hif4_dynamic_quantize_q(
     q_quant, q_scale, q_num_heads, head_dim, q_state,
 ):
     q = dequantize_nvfp4(q_quant, q_scale).float()
     q = _apply_q_transform(q, q_state, q_num_heads, head_dim)
     return _quantize_attention_tensor_hessian(
-        q, q_state['partner_h64'], q_state['partner_h256'],
+        q, q_state['partner_h64'], q_state['partner_hessian'],
     )
 
 

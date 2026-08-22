@@ -225,6 +225,14 @@ Attention 逐项结果：
 - 完整 checker 仍为 `9/12`，平均 calibration/dynamic 为 `7658.51/1478.25 ms`、总耗时 `34.68 s`。仅改变离线 permutation，动态步骤数不变；时延下降主要按 CPU 波动处理。
 - 改善版本已保存为 `solution_collection/solution_v175_.py`，并保留在当前 `solution.py`。
 
+### 当前 solution.py：Attention Hessian 按真实 head_dim 泛化
+
+- 移除 Attention scale refinement 中固定的 `256` group：calibration state 改为保存通用 `partner_hessian`，其 Q/K 形状分别为 `[q_num_heads, head_dim, head_dim]` 和 `[kv_num_heads, head_dim, head_dim]`；H64 初始化块数动态使用 `head_dim/64`。
+- `_refine_attention_scales` 根据 state 中 Hessian 的真实宽度推导 `head_width`、head 数和每 head 的 64-block 数，不再假设每个 head 恰好包含4个 H64 block。
+- 合成测试已覆盖 `head_dim=64/128/256/512`，均成功完成 calibration 和动态 Q/K 量化；例如 `head_dim=512, kv_heads=2` 保存 `[2,512,512]` K Hessian 并拆为16个 H64 block。
+- 本地真实 `head_dim=256` checker 的十项 MSE逐项与 v175 一致，仍为 `9/12`；平均 calibration/dynamic 为 `7788.92/1368.89 ms`、总耗时 `33.64 s`。动态步骤数没有增加，时延差异按 CPU 波动处理。
+- 当前实现要求 `head_dim` 为64的倍数，使 HiF4 的64元素 block 与 head 边界对齐；非64倍数需要额外 padding/permutation 设计，不能直接按当前参数布局表达独立 per-head Hessian。
+
 ## 未保存实验
 
 | 实验 | 结果 | 处理 |
