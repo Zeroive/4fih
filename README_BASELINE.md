@@ -255,6 +255,13 @@ Attention 逐项结果：
 - `v179_` 在 lv2 后再增加1轮 per-head Full-H mantissa repair，五项均进一步改善到 `7.6859e-4 / 4.2175e-4 / 2.8478e-4 / 2.7506e-4 / 2.5351e-4`，平均 `4.00738e-4`，相对 v177 改善约2.67%。Linear五项逐项不变，完整 checker保持10/12；平均 calibration/dynamic 为 `10025.07/2131.23 ms`、总耗时 `47.08 s`。
 - 两次相邻运行中，无 repair 版本没有表现出时延优势，计时差异被 CPU负载波动覆盖。因此当前 `solution.py` 采用精度更好的 v179完整路径；用户要求保留的无 repair折中版本单独保存为 `solution_collection/solution_v178_.py`，完整版本保存为 `solution_collection/solution_v179_.py`。
 
+### v180_：每个 KV group 的公共 Q/K permutation（实验快照）
+
+- reciprocal Q/K scale 后，为每个 KV group联合统计1个 K head与关联8个 Q heads的 RMS pressure，生成一个公共 permutation；同组 Q/K在 signed-H64前应用相同置换，因此标准 GQA点积保持不变。随机置换等价性验证的最大 QK数值差约 `1.0e-5`。
+- 8-channel mass balancing 的 Attention五项为 `7.8412e-4 / 4.2697e-4 / 2.8201e-4 / 2.6867e-4 / 2.4708e-4`，平均 `4.01770e-4`，比 v179 identity退化约0.26%。
+- H64 mass balancing 的五项为 `7.7885e-4 / 4.2349e-4 / 2.8022e-4 / 2.6829e-4 / 2.5073e-4`，平均 `4.00316e-4`，相对 v179 的 `4.00738e-4` 仅改善约0.105%；10/128-token退化，三个长序列改善。完整复测平均 calibration/dynamic 为 `9935.15/1859.81 ms`、总耗时 `43.49 s`。
+- H64版本按“有提升则保存”规则保留为 `solution_collection/solution_v180_.py`，但收益过小、短序列方向不一致且在线增加逐 head gather，因此不替换通用性优先的当前 v179主线。
+
 ### v177_：W/A/Q/K/V 反量化重建 MSE
 
 口径为本地 NVFP4 反量化张量经过当前完整变换和 HiF4 量化后再反量化。`变换域`直接比较量化器实际输入，`还原域`撤销 Smooth/permutation/Hadamard/QK reciprocal scale 后与原逻辑张量比较。
@@ -336,6 +343,7 @@ Softmax平均逐行 KL 为 `4.87319e-3`。普通逐元素 MSE随序列长度自�
 | Linear `full-H2048 -> H64` 后处理 | 在当前 full-H2048 mantissa + scale/lv3/lv2 完整 refinement 后，额外按 full Hessian 的 64×64 对角块执行1轮 mantissa refinement。Linear 五项从 `2.0117e-3 / 1.4517e-3 / 1.0111e-3 / 9.2490e-4 / 9.4106e-4` 退化为 `2.1304e-3 / 1.7093e-3 / 1.2789e-3 / 1.2153e-3 / 1.1955e-3`，平均从 `1.26809e-3` 升至 `1.50588e-3`，退化约18.75%；通过数由9/12降至7/12 | 放弃并恢复；H64 忽略跨 block 项，局部接受的更新会破坏已经优化好的 full-H2048 全局目标 |
 | Linear H8 Hadamard | 保留 v177 的8-channel mass balancing，只将 Linear 成对 Hadamard 从H64改成H8；Linear 五项为 `2.0048e-3 / 1.4210e-3 / 9.8926e-4 / 9.0786e-4 / 9.2953e-4`，平均 `1.25049e-3`，比 v177 H64 的 `1.21928e-3` 退化约2.56%。Attention 五项逐项不变 | 放弃并恢复H64；permutation适合按8通道细分负载，但旋转需要覆盖完整64-value量化块，才能摊平不同8-value小组之间的极值 |
 | Attention signed-H256 rotation | `head_dim=256` 时将每个 head 的四个独立 signed-H64 改为一个完整 signed-H256；Q/K 成对旋转最大点积数值差约 `9.5e-6`。Attention 五项为 `8.0868e-4 / 4.3170e-4 / 2.9300e-4 / 2.8511e-4 / 2.5922e-4`，平均 `4.15542e-4`，比 v177 signed-H64 的 `4.11734e-4` 退化约0.93%。后三个长序列样本改善，但10-token退化约4.61%，128-token也轻微退化 | 放弃并恢复 signed-H64；H256全局平滑有利于长序列，但短序列的少量关键方向被扩散到更多64-value量化块，平均精度与稳健性不如H64 |
+| v179 Full-H lv2/lv3 + signed-H256 | 在包含 per-head Full-H mantissa/scale/lv3/lv2/mantissa repair 的 v179 上重新测试完整 signed-H256。Attention五项为 `7.9753e-4 / 4.2398e-4 / 2.8187e-4 / 2.7254e-4 / 2.4870e-4`，平均 `4.04924e-4`，仍比 v179 signed-H64 的 `4.00738e-4` 退化约1.04%。后三个长序列样本改善，但10-token退化约3.77%，128-token也略差 | 放弃并恢复 signed-H64；Full-H hierarchy能补偿部分跨H64误差，但没有消除全head旋转的短序列损失 |
 | Attention signed-H8 rotation | 将每个 Attention head 的旋转从若干独立 signed-H64 改为更多独立 signed-H8，其他 v177 逻辑不变。Attention 五项为 `7.8872e-4 / 4.4053e-4 / 3.0530e-4 / 2.9627e-4 / 2.7314e-4`，平均 `4.20792e-4`，比 signed-H64 的 `4.11734e-4` 退化约2.20%；五项全部变差 | 放弃并恢复 signed-H64；H8 混合范围不足，无法在共享一级E6M2 scale的完整64-value block内充分摊平异常值 |
 | Linear `H64 -> global permute -> H64` | 关闭 H1024/H2048 时，固定 perfect-shuffle 平均 MSE `2.48232e-3`、数据驱动 pressure-balanced permutation 为 `2.50572e-3`，Linear 动态均约 `121–129 ms`；恢复与 v172 相同的 H1024 + 8轮 H2048 后，数据驱动版平均 `1.49348e-3`、动态约 `793.66 ms`，仍比 v172 的 `1.30276e-3` 退化约14.6%，且 Linear calibration 增至约 `15.29 s` | 放弃；第二层 H64 使第一层形成的量化友好局部结构和 covariance 分块重新变密，额外 refinement 只能部分追回精度 |
 | Linear normalized Gram `Diagonal + Low-rank` | 以量化权重 `Wq` 的随机 SVD 构造 `D + BB^T`，替换动态 H1024/full-H2048，均使用8轮 refinement。rank-32/64/128 的 Linear 平均 MSE分别为 `1.64958e-3` / `1.60632e-3` / `1.55216e-3`，state 约 `132/260/516 KiB`；rank-128 仍比 v172 的 `1.30276e-3` 退化约19.1%。各次原始 Linear 动态均值约 `274–438 ms`，明显低于 full-H2048 的受控约 `817.79 ms`，但 CPU负载波动较大；随机低秩分解使 Linear calibration 约为 `14.3–15.5 s` | 不合入精度优先主线；权重 Gram 的谱不够低秩，适合作为低内存/低时延分支，而不能无损替代 full-H2048 |
