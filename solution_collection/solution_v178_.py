@@ -1048,7 +1048,7 @@ def _quantize_attention_tensor_hessian(y, head_hessian):
     p = _refine_attention_scales(y, p, H, sweeps=1)
     p = _refine_attention_lv3_full_hessian(y, p, H, sweeps=1)
     p = _refine_attention_lv2_full_hessian(y, p, H, sweeps=1)
-    return _refine_attention_mantissas_full_hessian(y, p, H, sweeps=1)
+    return p
 
 
 # 功能：动态 K 量化：应用 K transform 后，同时比较 partner-aware quotient 候选与中心化 Hessian 候选。

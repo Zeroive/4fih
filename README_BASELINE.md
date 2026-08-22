@@ -241,6 +241,76 @@ Attention 逐项结果：
 - Linear 五项逐项不变，完整 checker 保持 `9/12`。清理后复测平均 calibration/dynamic 为 `8534.89/1447.28 ms`、总耗时 `35.66 s`；与此前运行的 CPU 波动区间相当，没有观察到明确时延增加。
 - 合成验证覆盖 `head_dim=64/128/256/512` 的 full-H mantissa 初始化。改善版本保存为 `solution_collection/solution_v176_.py`，并保留在当前 `solution.py`。
 
+### v177_：Linear permutation 采用 8-channel mass balancing
+
+- 将 `_safe139_massdiff_perm(mass, 64)` 改为 `_safe139_massdiff_perm(mass, 8)`。实际 HiF4 block、Hadamard 和 Hessian 尺寸仍保持不变，只把 permutation 的负载均衡桶从32个64-channel桶细化为256个8-channel桶，使异常通道先在 HiF4 的8-value层级均匀分散，再组合为H64。
+- Linear 五项从 `2.0117e-3 / 1.4517e-3 / 1.0111e-3 / 9.2490e-4 / 9.4106e-4` 全部改善为 `1.9790e-3 / 1.3913e-3 / 9.5518e-4 / 8.7744e-4 / 8.9350e-4`；平均从 `1.26809e-3` 降至 `1.21928e-3`，改善约3.85%。通过数从9/12提升到10/12。
+- Attention 五项与 v176 逐项完全一致，平均仍为 `4.11734e-4`。完整复测平均 calibration/dynamic 为 `9917.49/1623.70 ms`、总耗时 `42.20 s`；本轮未修改的 Attention 计时也同步上浮，因此主要按 CPU 负载波动记录。动态计算步骤没有增加。
+- 改善版本保存为 `solution_collection/solution_v177_.py`，并保留在当前 `solution.py`。
+
+### v178_ / v179_：Attention per-head Full-H lv3/lv2
+
+- 在 v177 的 Attention `Self-MSE → per-head Full-H mantissa → Full-H scale` 后增加逐 head `Full-H lv3 → Full-H lv2`。每个4-value/8-value toggle均使用完整 `head_dim×head_dim` partner Hessian评分，严格下降才接受，并立即用 `H[changed,:]` 更新同一 head 的全局梯度。
+- `v178_` 为不含最终 mantissa repair 的保留版本。Attention五项为 `7.7220e-4 / 4.2836e-4 / 2.9302e-4 / 2.8435e-4 / 2.6341e-4`，平均 `4.08268e-4`，相对 v177 的 `4.11734e-4` 改善约0.84%。完整复测平均 calibration/dynamic 为 `10627.86/2232.88 ms`、总耗时 `48.87 s`。
+- `v179_` 在 lv2 后再增加1轮 per-head Full-H mantissa repair，五项均进一步改善到 `7.6859e-4 / 4.2175e-4 / 2.8478e-4 / 2.7506e-4 / 2.5351e-4`，平均 `4.00738e-4`，相对 v177 改善约2.67%。Linear五项逐项不变，完整 checker保持10/12；平均 calibration/dynamic 为 `10025.07/2131.23 ms`、总耗时 `47.08 s`。
+- 两次相邻运行中，无 repair 版本没有表现出时延优势，计时差异被 CPU负载波动覆盖。因此当前 `solution.py` 采用精度更好的 v179完整路径；用户要求保留的无 repair折中版本单独保存为 `solution_collection/solution_v178_.py`，完整版本保存为 `solution_collection/solution_v179_.py`。
+
+### v177_：W/A/Q/K/V 反量化重建 MSE
+
+口径为本地 NVFP4 反量化张量经过当前完整变换和 HiF4 量化后再反量化。`变换域`直接比较量化器实际输入，`还原域`撤销 Smooth/permutation/Hadamard/QK reciprocal scale 后与原逻辑张量比较。
+
+| 张量 | 变换域 MSE | 还原域 MSE |
+| --- | ---: | ---: |
+| W | `2.45529e-6` | `2.47934e-6` |
+| A（五组平均） | `2.53220e-3` | `2.77844e-3` |
+| Q（五组平均） | `8.62629e-3` | `1.06086e-2` |
+| K（五组平均） | `6.43602e-1` | `8.39369e-1` |
+| K centered（五组平均） | — | `7.01218e-3` |
+| V（五组平均） | `1.49745e-3` | `1.49745e-3` |
+
+K普通 MSE受 softmax-invariant translation 主导，不能直接代表 Attention 损失，因此主要参考 K centered。
+
+| tokens | A还原域 | Q还原域 | K centered | V | Softmax逐元素 | Softmax每行平方L2 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | `3.36453e-3` | `9.88417e-3` | `3.46045e-3` | `1.78178e-3` | `6.65531e-5` | `6.65531e-4` |
+| 128 | `3.04896e-3` | `1.04005e-2` | `6.36481e-3` | `1.54803e-3` | `5.03604e-6` | `6.44613e-4` |
+| 512 | `2.54128e-3` | `1.08353e-2` | `8.03085e-3` | `1.39023e-3` | `1.34978e-6` | `6.91087e-4` |
+| 1024-A | `2.54255e-3` | `1.09262e-2` | `8.58219e-3` | `1.41029e-3` | `6.93882e-7` | `7.10536e-4` |
+| 1024-B | `2.39487e-3` | `1.09969e-2` | `8.62262e-3` | `1.35691e-3` | `6.69370e-7` | `6.85435e-4` |
+| 五组平均 | `2.77844e-3` | `1.06086e-2` | `7.01218e-3` | `1.49745e-3` | `1.48604e-5` | `6.79440e-4` |
+
+Softmax平均逐行 KL 为 `4.87319e-3`。普通逐元素 MSE随序列长度自然下降，因此跨长度更适合比较每行概率向量平方L2。
+
+#### Q/K/V/Softmax 大值区域
+
+按原始绝对值选择每个测试张量的 top 10%～50%；Softmax 对每个 query/head 概率行独立选择最大概率。表内为五组测试平均 selected-position MSE。
+
+| Top比例 | Q | K centered | K raw | V | Softmax概率 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 10% | `2.40018e-2` | `1.01464e-2` | `4.79968` | `3.63171e-3` | `8.03137e-5` |
+| 20% | `1.83264e-2` | `8.98858e-3` | `2.86287` | `2.60357e-3` | `5.62979e-5` |
+| 30% | `1.56686e-2` | `8.40658e-3` | `2.10628` | `2.18728e-3` | `4.31876e-5` |
+| 40% | `1.41389e-2` | `8.02919e-3` | `1.69441` | `1.95989e-3` | `3.45545e-5` |
+| 50% | `1.31180e-2` | `7.77197e-3` | `1.42622` | `1.81722e-3` | `2.84654e-5` |
+
+#### W/A/MatMul/Attention output 大值区域
+
+按原始绝对值选择 top 10%～50%。W为单个权重张量，其余为五组测试平均 selected-position MSE。
+
+| Top比例 | W | A | W@A输出 | Attention输出 |
+| ---: | ---: | ---: | ---: | ---: |
+| 10% | `3.17257e-6` | `5.08736e-3` | `1.84313e-3` | `1.11108e-3` |
+| 20% | `2.91530e-6` | `3.88348e-3` | `1.65359e-3` | `8.41196e-4` |
+| 30% | `2.83249e-6` | `3.44643e-3` | `1.53053e-3` | `7.13353e-4` |
+| 40% | `2.72717e-6` | `3.21932e-3` | `1.43022e-3` | `6.29313e-4` |
+| 50% | `2.65311e-6` | `3.07200e-3` | `1.34909e-3` | `5.67431e-4` |
+
+| Top10%相对全部位置平均 | W | A | W@A输出 | Attention输出 | Softmax概率 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 倍率 | `1.28×` | `1.83×` | `1.51×` | `2.70×` | `5.4×` |
+
+这些是本地 mini-sample 的 reconstruction诊断，不用于推断线上数据分布。
+
 ## 未保存实验
 
 | 实验 | 结果 | 处理 |
@@ -264,6 +334,9 @@ Attention 逐项结果：
 | Attention 两轮 permutation | 第一轮按 robust outlier score 分组后 test 平均 `4.00243e-4`；第二轮按 Hessian-weighted residual 集中分组为 `4.02958e-4`，跨 block 均衡为 `4.01525e-4`，均差于 v171 的 `3.98149e-4`；两轮版 calibration 约 `6.9–11.3 s` | 实验实现保留，不合入 solution；存在 calibration 过拟合且开销过大 |
 | `solution_tmp.py` 动态 Linear 移除小块 Hessian | 完整 H64+H256 平均 `1.24839e-3`；仅去 H64 为 `1.24224e-3`；仅去 H256 为 `1.24924e-3`；同时去 H64/H256 最佳，为 `1.23598e-3`。离线 Weight 参数保持相同，只消融 activation state/动态路径 | 小块目标与 H1024/H2048 存在冲突；值得形成 tmp 精简版后串行复测时延 |
 | Linear `full-H2048 -> H64` 后处理 | 在当前 full-H2048 mantissa + scale/lv3/lv2 完整 refinement 后，额外按 full Hessian 的 64×64 对角块执行1轮 mantissa refinement。Linear 五项从 `2.0117e-3 / 1.4517e-3 / 1.0111e-3 / 9.2490e-4 / 9.4106e-4` 退化为 `2.1304e-3 / 1.7093e-3 / 1.2789e-3 / 1.2153e-3 / 1.1955e-3`，平均从 `1.26809e-3` 升至 `1.50588e-3`，退化约18.75%；通过数由9/12降至7/12 | 放弃并恢复；H64 忽略跨 block 项，局部接受的更新会破坏已经优化好的 full-H2048 全局目标 |
+| Linear H8 Hadamard | 保留 v177 的8-channel mass balancing，只将 Linear 成对 Hadamard 从H64改成H8；Linear 五项为 `2.0048e-3 / 1.4210e-3 / 9.8926e-4 / 9.0786e-4 / 9.2953e-4`，平均 `1.25049e-3`，比 v177 H64 的 `1.21928e-3` 退化约2.56%。Attention 五项逐项不变 | 放弃并恢复H64；permutation适合按8通道细分负载，但旋转需要覆盖完整64-value量化块，才能摊平不同8-value小组之间的极值 |
+| Attention signed-H256 rotation | `head_dim=256` 时将每个 head 的四个独立 signed-H64 改为一个完整 signed-H256；Q/K 成对旋转最大点积数值差约 `9.5e-6`。Attention 五项为 `8.0868e-4 / 4.3170e-4 / 2.9300e-4 / 2.8511e-4 / 2.5922e-4`，平均 `4.15542e-4`，比 v177 signed-H64 的 `4.11734e-4` 退化约0.93%。后三个长序列样本改善，但10-token退化约4.61%，128-token也轻微退化 | 放弃并恢复 signed-H64；H256全局平滑有利于长序列，但短序列的少量关键方向被扩散到更多64-value量化块，平均精度与稳健性不如H64 |
+| Attention signed-H8 rotation | 将每个 Attention head 的旋转从若干独立 signed-H64 改为更多独立 signed-H8，其他 v177 逻辑不变。Attention 五项为 `7.8872e-4 / 4.4053e-4 / 3.0530e-4 / 2.9627e-4 / 2.7314e-4`，平均 `4.20792e-4`，比 signed-H64 的 `4.11734e-4` 退化约2.20%；五项全部变差 | 放弃并恢复 signed-H64；H8 混合范围不足，无法在共享一级E6M2 scale的完整64-value block内充分摊平异常值 |
 | Linear `H64 -> global permute -> H64` | 关闭 H1024/H2048 时，固定 perfect-shuffle 平均 MSE `2.48232e-3`、数据驱动 pressure-balanced permutation 为 `2.50572e-3`，Linear 动态均约 `121–129 ms`；恢复与 v172 相同的 H1024 + 8轮 H2048 后，数据驱动版平均 `1.49348e-3`、动态约 `793.66 ms`，仍比 v172 的 `1.30276e-3` 退化约14.6%，且 Linear calibration 增至约 `15.29 s` | 放弃；第二层 H64 使第一层形成的量化友好局部结构和 covariance 分块重新变密，额外 refinement 只能部分追回精度 |
 | Linear normalized Gram `Diagonal + Low-rank` | 以量化权重 `Wq` 的随机 SVD 构造 `D + BB^T`，替换动态 H1024/full-H2048，均使用8轮 refinement。rank-32/64/128 的 Linear 平均 MSE分别为 `1.64958e-3` / `1.60632e-3` / `1.55216e-3`，state 约 `132/260/516 KiB`；rank-128 仍比 v172 的 `1.30276e-3` 退化约19.1%。各次原始 Linear 动态均值约 `274–438 ms`，明显低于 full-H2048 的受控约 `817.79 ms`，但 CPU负载波动较大；随机低秩分解使 Linear calibration 约为 `14.3–15.5 s` | 不合入精度优先主线；权重 Gram 的谱不够低秩，适合作为低内存/低时延分支，而不能无损替代 full-H2048 |
 | full-Hessian refinement 32轮 | Linear 五项为 `1.8303e-3 / 1.4319e-3 / 1.0342e-3 / 9.5436e-4 / 9.6453e-4`，平均 `1.24306e-3`，相对10轮的 `1.30202e-3` 改善约 `4.53%`；通过数从 `7/12` 提升到 `9/12`。相邻运行 Linear 动态均值从约 `1053 ms` 增至 `2839 ms`，约为 `2.70×`；整轮平均动态时延从 `1461.41 ms` 增至 `2451.19 ms` | 精度有收益，但时延增长过大；恢复10轮，不保存版本 |

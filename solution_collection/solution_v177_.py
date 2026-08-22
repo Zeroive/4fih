@@ -621,155 +621,6 @@ def _refine_attention_scales(y, p, head_hessian, sweeps=1):
         pp['mant'] = mav.reshape_as(pp['mant']).to(torch.bfloat16)
     return pp
 
-
-# 功能：在逐 head 完整 Hessian 下优化每个 4-value group 的 lv3。
-# 说明：每个 H64/head 每行只接受一个最佳 toggle，并用完整 H[changed,:] 立即更新梯度。
-def _refine_attention_lv3_full_hessian(y, p, head_hessian, sweeps=1):
-    shape = tuple(int(s) for s in y.shape)
-    if y.dim() != 2 or head_hessian.dim() != 3:
-        return p
-    rows, k = shape
-    head_width = int(head_hessian.shape[-1])
-    if head_width % 64 != 0 or k % head_width != 0:
-        return p
-    num_heads = k // head_width
-    if tuple(head_hessian.shape) != (num_heads, head_width, head_width):
-        return p
-
-    pp = _v64_clone_params(p)
-    blocks_per_head = head_width // 64
-    yy = y.float().reshape(rows, num_heads, head_width)
-    H = head_hessian.to(y.device, torch.float32)
-    sfv = pp['scale_factor'].float().reshape(rows, num_heads, blocks_per_head)
-    l2v = pp['scale_lv2'].float().reshape(rows, num_heads, blocks_per_head, 8)
-    l3v = pp['scale_lv3'].float().reshape(rows, num_heads, blocks_per_head, 16)
-    sgv = pp['sign'].float().reshape(rows, num_heads, blocks_per_head, 16, 4)
-    mav = pp['mant'].float().reshape(rows, num_heads, blocks_per_head, 16, 4)
-    q = _v64_dequant_params(pp, shape).reshape(rows, num_heads, head_width)
-    grad = torch.einsum('rgi,gij->rgj', q - yy, H)
-    head_index = torch.arange(num_heads, device=y.device).reshape(1, num_heads, 1).expand(rows, num_heads, 4)
-
-    for _ in range(int(sweeps)):
-        for block in range(blocks_per_head):
-            lo = block * 64
-            hi = lo + 64
-            z4 = yy[:, :, lo:hi].reshape(rows, num_heads, 16, 4)
-            q4 = q[:, :, lo:hi].reshape(rows, num_heads, 16, 4)
-            g4 = grad[:, :, lo:hi].reshape(rows, num_heads, 16, 4)
-            cur = l3v[:, :, block]
-            new = torch.where(cur > 1.5, torch.ones_like(cur), torch.full_like(cur, 2.0))
-            eff = (
-                sfv[:, :, block, None]
-                * l2v[:, :, block].repeat_interleave(2, dim=-1)
-                * new
-            )
-            ma = (torch.round(z4.abs() / eff[..., None].clamp_min(2.0 ** (-48)) * 4.0) * 0.25).clamp(0.0, 1.75)
-            sg = torch.where(ma == 0.0, torch.zeros_like(z4), torch.sign(z4))
-            qn = sg * ma * eff[..., None]
-            d = qn - q4
-            H4 = torch.stack(
-                [H[:, lo + i * 4:lo + (i + 1) * 4, lo + i * 4:lo + (i + 1) * 4] for i in range(16)],
-                dim=1,
-            )
-            delta = 2.0 * (d * g4).sum(-1) + torch.einsum('rgbi,gbij,rgbj->rgb', d, H4, d)
-            best, choice = delta.min(dim=-1)
-            good = best < -1e-8
-            pick4 = choice[..., None, None].expand(rows, num_heads, 1, 4)
-            qold = q4.gather(2, pick4).squeeze(2)
-            qnew = qn.gather(2, pick4).squeeze(2)
-            qaccepted = torch.where(good[..., None], qnew, qold)
-            coords = lo + choice[..., None] * 4 + torch.arange(4, device=y.device)
-            q.scatter_(2, coords, qaccepted)
-            dq = qaccepted - qold
-            grad.add_(torch.einsum('rgi,rgij->rgj', dq, H[head_index, coords]))
-
-            old_lv3 = cur.gather(2, choice[..., None]).squeeze(-1)
-            cur.scatter_(2, choice[..., None], torch.where(good, new.gather(2, choice[..., None]).squeeze(-1), old_lv3)[..., None])
-            old_ma = mav[:, :, block].gather(2, pick4).squeeze(2)
-            old_sg = sgv[:, :, block].gather(2, pick4).squeeze(2)
-            new_ma = ma.gather(2, pick4).squeeze(2)
-            new_sg = sg.gather(2, pick4).squeeze(2)
-            mav[:, :, block].scatter_(2, pick4, torch.where(good[..., None], new_ma, old_ma)[:, :, None, :])
-            sgv[:, :, block].scatter_(2, pick4, torch.where(good[..., None], new_sg, old_sg)[:, :, None, :])
-
-    pp['scale_lv3'] = l3v.reshape_as(pp['scale_lv3']).to(torch.bfloat16)
-    pp['sign'] = sgv.reshape_as(pp['sign']).to(torch.bfloat16)
-    pp['mant'] = mav.reshape_as(pp['mant']).to(torch.bfloat16)
-    return pp
-
-
-# 功能：在逐 head 完整 Hessian 下优化每个 8-value group 的 lv2。
-# 说明：候选评分和接受后的梯度更新包含同一 head 内所有 H64 block 的相关性。
-def _refine_attention_lv2_full_hessian(y, p, head_hessian, sweeps=1):
-    shape = tuple(int(s) for s in y.shape)
-    if y.dim() != 2 or head_hessian.dim() != 3:
-        return p
-    rows, k = shape
-    head_width = int(head_hessian.shape[-1])
-    if head_width % 64 != 0 or k % head_width != 0:
-        return p
-    num_heads = k // head_width
-    if tuple(head_hessian.shape) != (num_heads, head_width, head_width):
-        return p
-
-    pp = _v64_clone_params(p)
-    blocks_per_head = head_width // 64
-    yy = y.float().reshape(rows, num_heads, head_width)
-    H = head_hessian.to(y.device, torch.float32)
-    sfv = pp['scale_factor'].float().reshape(rows, num_heads, blocks_per_head)
-    l2v = pp['scale_lv2'].float().reshape(rows, num_heads, blocks_per_head, 8)
-    l3v = pp['scale_lv3'].float().reshape(rows, num_heads, blocks_per_head, 8, 2)
-    sgv = pp['sign'].float().reshape(rows, num_heads, blocks_per_head, 8, 8)
-    mav = pp['mant'].float().reshape(rows, num_heads, blocks_per_head, 8, 8)
-    q = _v64_dequant_params(pp, shape).reshape(rows, num_heads, head_width)
-    grad = torch.einsum('rgi,gij->rgj', q - yy, H)
-    head_index = torch.arange(num_heads, device=y.device).reshape(1, num_heads, 1).expand(rows, num_heads, 8)
-
-    for _ in range(int(sweeps)):
-        for block in range(blocks_per_head):
-            lo = block * 64
-            hi = lo + 64
-            z8 = yy[:, :, lo:hi].reshape(rows, num_heads, 8, 2, 4)
-            q8 = q[:, :, lo:hi].reshape(rows, num_heads, 8, 8)
-            g8 = grad[:, :, lo:hi].reshape(rows, num_heads, 8, 8)
-            cur = l2v[:, :, block]
-            new = torch.where(cur > 1.5, torch.ones_like(cur), torch.full_like(cur, 2.0))
-            eff = sfv[:, :, block, None, None, None] * new[..., None, None] * l3v[:, :, block, :, :, None]
-            ma = (torch.round(z8.abs() / eff.clamp_min(2.0 ** (-48)) * 4.0) * 0.25).clamp(0.0, 1.75)
-            sg = torch.where(ma == 0.0, torch.zeros_like(z8), torch.sign(z8))
-            qn = (sg * ma * eff).reshape(rows, num_heads, 8, 8)
-            d = qn - q8
-            H8 = torch.stack(
-                [H[:, lo + i * 8:lo + (i + 1) * 8, lo + i * 8:lo + (i + 1) * 8] for i in range(8)],
-                dim=1,
-            )
-            delta = 2.0 * (d * g8).sum(-1) + torch.einsum('rgbi,gbij,rgbj->rgb', d, H8, d)
-            best, choice = delta.min(dim=-1)
-            good = best < -1e-8
-            pick8 = choice[..., None, None].expand(rows, num_heads, 1, 8)
-            qold = q8.gather(2, pick8).squeeze(2)
-            qnew = qn.gather(2, pick8).squeeze(2)
-            qaccepted = torch.where(good[..., None], qnew, qold)
-            coords = lo + choice[..., None] * 8 + torch.arange(8, device=y.device)
-            q.scatter_(2, coords, qaccepted)
-            dq = qaccepted - qold
-            grad.add_(torch.einsum('rgi,rgij->rgj', dq, H[head_index, coords]))
-
-            old_lv2 = cur.gather(2, choice[..., None]).squeeze(-1)
-            cur.scatter_(2, choice[..., None], torch.where(good, new.gather(2, choice[..., None]).squeeze(-1), old_lv2)[..., None])
-            old_ma = mav[:, :, block].gather(2, pick8).squeeze(2)
-            old_sg = sgv[:, :, block].gather(2, pick8).squeeze(2)
-            new_ma = qn.new_empty(old_ma.shape)
-            new_ma.copy_(ma.reshape(rows, num_heads, 8, 8).gather(2, pick8).squeeze(2))
-            new_sg = sg.reshape(rows, num_heads, 8, 8).gather(2, pick8).squeeze(2)
-            mav[:, :, block].scatter_(2, pick8, torch.where(good[..., None], new_ma, old_ma)[:, :, None, :])
-            sgv[:, :, block].scatter_(2, pick8, torch.where(good[..., None], new_sg, old_sg)[:, :, None, :])
-
-    pp['scale_lv2'] = l2v.reshape_as(pp['scale_lv2']).to(torch.bfloat16)
-    pp['sign'] = sgv.reshape_as(pp['sign']).to(torch.bfloat16)
-    pp['mant'] = mav.reshape_as(pp['mant']).to(torch.bfloat16)
-    return pp
-
 # 功能：汇总多组 activation 样本的逐通道 RMS，用于后续通道压力/排序估计。
 # =============================================================================
 # ============================== LINEAR PART ==================================
@@ -1045,10 +896,9 @@ def _quantize_attention_tensor_hessian(y, head_hessian):
     H = head_hessian.to(y.device, torch.float32)
     p, _ = _quantize_tensor_self_mse(y, return_dequant=False)
     p = _refine_attention_mantissas_full_hessian(y, p, H, sweeps=1)
-    p = _refine_attention_scales(y, p, H, sweeps=1)
-    p = _refine_attention_lv3_full_hessian(y, p, H, sweeps=1)
-    p = _refine_attention_lv2_full_hessian(y, p, H, sweeps=1)
-    return _refine_attention_mantissas_full_hessian(y, p, H, sweeps=1)
+    return _refine_attention_scales(
+        y, p, H, sweeps=1,
+    )
 
 
 # 功能：动态 K 量化：应用 K transform 后，同时比较 partner-aware quotient 候选与中心化 Hessian 候选。
