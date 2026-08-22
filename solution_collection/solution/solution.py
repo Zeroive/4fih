@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 import math
+import heapq
 from typing import Optional, Tuple
 import torch
 _HIF4_BLOCK = 64
@@ -540,80 +541,8 @@ def _safe90_apply(x, smooth, perm, phases, had, weight_side=False):
         y = _fwht64_v31(y)
     return y
 
-def _safe90_hessian64(wq):
-    if wq.dim() != 2 or wq.shape[-1] % 64 != 0:
-        return None
-    m, k = map(int, wq.shape)
-    nb = k // 64
-    z = wq.float().reshape(m, nb, 64)
-    H = torch.einsum('mbi,mbj->bij', z, z)
-    sc = H.diagonal(dim1=-2, dim2=-1).mean(-1).abs().clamp_min(1e-12)
-    return H / sc[:, None, None]
 
-def _safe90_hessian256(wq):
-    if wq.dim() != 2 or wq.shape[-1] % 256 != 0:
-        return None
-    m, k = map(int, wq.shape)
-    ng = k // 256
-    z = wq.float().reshape(m, ng, 256)
-    H = torch.einsum('mgi,mgj->gij', z, z)
-    sc = H.diagonal(dim1=-2, dim2=-1).mean(-1).abs().clamp_min(1e-12)
-    return H / sc[:, None, None]
 
-def _safe90_refine256(y, p, H, iters=4):
-    """Hessian-only Super256 OMCD: minimize (Q(A)-A)^T H (Q(A)-A)."""
-    shape = tuple((int(s) for s in y.shape))
-    k = shape[-1]
-    if k % 256 != 0 or not isinstance(H, torch.Tensor):
-        return p
-    rows = y.numel() // k
-    ng = k // 256
-    nb = k // 64
-    if tuple(H.shape) != (ng, 256, 256):
-        return p
-    pp = _v64_clone_params(p)
-    sf = pp['scale_factor'].float().reshape(rows, nb, 1, 1, 1)
-    l2 = pp['scale_lv2'].float().reshape(rows, nb, 8, 1, 1)
-    l3 = pp['scale_lv3'].float().reshape(rows, nb, 8, 2, 1)
-    eff = (sf * l2 * l3).expand(rows, nb, 8, 2, 4).reshape(rows, ng, 256)
-    u = (pp['sign'].float() * pp['mant'].float()).reshape(rows, ng, 256)
-    yy = y.float().reshape(rows, ng, 256)
-    H = H.to(y.device, torch.float32)
-    q = u * eff
-    e = q - yy
-    g = torch.einsum('gij,rgi->rgj', H, e)
-    diag = H.diagonal(dim1=-2, dim2=-1).unsqueeze(0)
-    step = 0.25 * eff
-    step2 = step.square() * diag
-    gidx = torch.arange(ng, device=y.device).view(1, ng).expand(rows, ng)
-    for _ in range(int(iters)):
-        for sub in range(4):
-            lo = sub * 64
-            hi = lo + 64
-            base = 2.0 * step[:, :, lo:hi] * g[:, :, lo:hi]
-            dp = base + step2[:, :, lo:hi]
-            dm = -base + step2[:, :, lo:hi]
-            us = u[:, :, lo:hi]
-            dp.masked_fill_(us >= 1.75 - 1e-06, float('inf'))
-            dm.masked_fill_(us <= -1.75 + 1e-06, float('inf'))
-            choose = dp < dm
-            move = torch.minimum(dp, dm)
-            best, j0 = move.min(dim=2)
-            good = best < -1e-08
-            plus = choose.gather(2, j0.unsqueeze(-1)).squeeze(-1)
-            direction = torch.where(plus, torch.ones_like(best), -torch.ones_like(best))
-            du = 0.25 * direction * good
-            j = j0 + lo
-            u.scatter_add_(2, j.unsqueeze(-1), du.unsqueeze(-1))
-            de = du * eff.gather(2, j.unsqueeze(-1)).squeeze(-1)
-            col = H[gidx, :, j]
-            g.add_(col * de.unsqueeze(-1))
-    ma = u.abs().reshape(rows, nb, 64)
-    sg = torch.sign(u).reshape(rows, nb, 64)
-    sg = torch.where(ma == 0.0, torch.zeros_like(sg), sg)
-    pp['mant'] = ma.reshape_as(pp['mant']).to(torch.bfloat16)
-    pp['sign'] = sg.reshape_as(pp['sign']).to(torch.bfloat16)
-    return pp
 
 def _safe90_make_state(version, smooth, perm, had, phases, **extra):
     st = {'version': version, 'rule_safe_no_AW': True, 'beta': 0.5, 'smooth': smooth.detach().cpu().float(), 'perm': perm.detach().cpu().to(torch.int32), 'hadamard64': bool(had), 'block_phase': phases.detach().cpu().float()}
@@ -629,38 +558,9 @@ def _safe90_decode_transform_activation(activation_quant, activation_scale, st):
         return a
     return _safe90_apply(a, s.to(a.device), perm.to(a.device), ph.to(a.device), bool(st.get('hadamard64', False)), False)
 
-def _safe105_slice_params(p, st, en):
-    return {k: v[st:en].clone() for k, v in p.items()}
 
-def _safe105_write_params(dst, src, st, en):
-    for k in dst:
-        dst[k][st:en] = src[k]
-    return dst
 
-def _safe105_chunked_weight_h256(wt, p, HA256, iters=1, chunk_rows=256):
-    """Memory-bounded H256 mantissa refinement for offline Weight."""
-    if not isinstance(HA256, torch.Tensor) or wt.dim() != 2 or wt.shape[-1] % 256:
-        return p
-    out = _v64_clone_params(p)
-    m = int(wt.shape[0])
-    for st in range(0, m, int(chunk_rows)):
-        en = min(st + int(chunk_rows), m)
-        pc = _safe105_slice_params(out, st, en)
-        pc = _safe90_refine256(wt[st:en], pc, HA256, int(iters))
-        _safe105_write_params(out, pc, st, en)
-    return out
 
-def _safe105_make_state(version, s, perm, had, ph, wq, extra=None):
-    H64 = _safe90_hessian64(wq)
-    H256 = _safe90_hessian256(wq)
-    st = _safe90_make_state(version, s, perm, had, ph, transform_kind='safe_v40_marginal', super256_iters=4)
-    if extra:
-        st.update(extra)
-    if isinstance(H64, torch.Tensor):
-        st['weight_hessian_blocks'] = H64.detach().cpu().to(torch.bfloat16)
-    if isinstance(H256, torch.Tensor):
-        st['super256_hessian_blocks'] = H256.detach().cpu().to(torch.bfloat16)
-    return st
 
 def _safe108_norm_h(H):
     H = H.float()
@@ -817,15 +717,12 @@ def _safe111_attach(calib_qkv_list, q_num_heads, kv_num_heads, head_dim, use_q_h
     out = _safe111_fixed_attention_base(calib_qkv_list, q_num_heads, kv_num_heads, head_dim)
     return _safe108_attach_cov_state(out, calib_qkv_list, q_num_heads, kv_num_heads, head_dim, use_q_h256=bool(use_q_h256), use_k_metric=bool(use_k_metric))
 
-def _safe111_v(v_quant, v_scale, kv_num_heads, head_dim, v_state):
-    v = dequantize_nvfp4(v_quant, v_scale).float()
-    return _quantize_tensor_self_mse(v, return_dequant=False)[0]
-
 def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_dim):
     return _safe111_attach(calib_qkv_list, q_num_heads, kv_num_heads, head_dim, use_q_h256=True, use_k_metric=True)
 
 def hif4_dynamic_quantize_v(v_quant, v_scale, kv_num_heads, head_dim, v_state):
-    return _safe111_v(v_quant, v_scale, kv_num_heads, head_dim, v_state)
+    v = dequantize_nvfp4(v_quant, v_scale).float()
+    return _quantize_tensor_self_mse(v, return_dequant=False)[0]
 
 def _safe130_q(y, p):
     return _v64_dequant_params(p, tuple((int(s) for s in y.shape))).float()
@@ -918,7 +815,6 @@ def _safe130_scale_core(y, p, H256, sweeps=1):
         pp['sign'] = sgv.reshape_as(pp['sign']).to(torch.bfloat16)
         pp['mant'] = mav.reshape_as(pp['mant']).to(torch.bfloat16)
     return pp
-import heapq
 
 def _safe139_sample_rms(ats, k):
     acc = torch.zeros(k, device=ats[0].device, dtype=torch.float32)
@@ -1052,82 +948,84 @@ def _v156_cov_adaptive(acts_t, k, device, group=64, alpha=0.5, rmin=0.4, rmax=0.
     Hr = rho[:, None, None] * Hn + (1 - rho[:, None, None]) * D
     return (Hr, rho)
 
-def _v156_linear(weight_quant, weight_scale, calib_activation_list):
-    w = dequantize_nvfp4(weight_quant, weight_scale).float()
-    acts = _rule_safe_decode_acts(calib_activation_list, w.shape[-1], w.device)
-    s, perm, had, ph, post, wt, acts_t = _safe147_geometry(w, acts, perm_kind='mass_act', post_pressure='max', robust_phase_mix=0.0)
-    k = int(w.shape[-1])
-    H64, r64 = _v156_cov_adaptive(acts_t, k, w.device, 64, 0.5, 0.4, 0.8, 1.0)
-    H256, r256 = _v156_cov_adaptive(acts_t, k, w.device, 256, 0.5, 0.4, 0.8, 1.0)
-    wp, wq = _v37_quantize_hessian(wt, H64, return_dequant=True) if isinstance(H64, torch.Tensor) else _quantize_tensor_self_mse(wt, return_dequant=True)
-    if isinstance(H256, torch.Tensor):
-        wp = _safe105_chunked_weight_h256(wt, wp, H256, iters=4, chunk_rows=256)
-    wq = _v64_dequant_params(wp, tuple(w.shape)).float()
-    st = _safe105_make_state('v156', s, perm, had, ph, wq, {'post_perm': post.cpu().to(torch.int32), 'post_perm_enabled': True, 'rho64_mean': float(r64.mean()) if isinstance(r64, torch.Tensor) else 0.0, 'rho256_mean': float(r256.mean()) if isinstance(r256, torch.Tensor) else 0.0})
-    return {'weight_params': wp, 'activation_state': st}
 
-def _v158_lv3_greedy(y, p, H256, iters=2):
-    shape = tuple((int(s) for s in y.shape))
-    k = shape[-1]
-    if y.dim() != 2 or k % 256 or (not isinstance(H256, torch.Tensor)):
-        return p
-    rows = int(y.shape[0])
-    ng = k // 256
-    nb = k // 64
-    H = H256.to(y.device, torch.float32)
-    pp = _v64_clone_params(p)
-    yy = y.float().reshape(rows, ng, 256)
-    q = _v64_dequant_params(pp, shape).float().reshape(rows, ng, 256)
-    g = torch.einsum('gij,rgi->rgj', H, q - yy)
-    sf = pp['scale_factor'].float().reshape(rows, nb)
-    l2 = pp['scale_lv2'].float().reshape(rows, nb, 8)
-    l3 = pp['scale_lv3'].float().reshape(rows, nb, 8, 2)
-    sgv = pp['sign'].float().reshape(rows, nb, 8, 2, 4)
-    mav = pp['mant'].float().reshape(rows, nb, 8, 2, 4)
-    sf4 = sf.reshape(rows, ng, 4, 1, 1).expand(rows, ng, 4, 8, 2).reshape(rows, ng, 64)
-    l24 = l2.reshape(rows, ng, 4, 8, 1).expand(rows, ng, 4, 8, 2).reshape(rows, ng, 64)
-    l34 = l3.reshape(rows, ng, 4, 8, 2).reshape(rows, ng, 64)
-    z4 = yy.reshape(rows, ng, 64, 4)
-    q4 = q.reshape(rows, ng, 64, 4)
-    H4 = torch.stack([H[:, i * 4:(i + 1) * 4, i * 4:(i + 1) * 4] for i in range(64)], dim=1)
-    for _ in range(int(iters)):
-        new = torch.where(l34 > 1.5, torch.ones_like(l34), torch.full_like(l34, 2.0))
-        eff = sf4 * l24 * new
-        ma = (torch.round(z4.abs() / eff[:, :, :, None].clamp_min(2 ** (-48)) * 4.0) * 0.25).clamp(0, 1.75)
-        sg = torch.where(ma == 0, torch.zeros_like(z4), torch.sign(z4))
-        qn = sg * ma * eff[:, :, :, None]
-        d = qn - q4
-        g4 = g.reshape(rows, ng, 64, 4)
-        delta = 2 * (d * g4).sum(-1) + torch.einsum('rgbi,gbij,rgbj->rgb', d, H4, d)
-        best, idx = delta.min(-1)
-        good = best < -1e-08
-        sel = idx[:, :, None, None].expand(rows, ng, 1, 4)
-        dsel = d.gather(2, sel).squeeze(2) * good[:, :, None]
-        qnsel = qn.gather(2, sel).squeeze(2)
-        masel = ma.gather(2, sel).squeeze(2)
-        sgsel = sg.gather(2, sel).squeeze(2)
-        newsel = new.gather(2, idx[:, :, None]).squeeze(2)
-        de = torch.zeros((rows, ng, 256), device=y.device, dtype=torch.float32)
-        coord = (idx * 4)[:, :, None] + torch.arange(4, device=y.device).view(1, 1, 4)
-        de.scatter_(2, coord, dsel)
-        g.add_(torch.einsum('gij,rgj->rgi', H, de))
-        oldq = q4.gather(2, sel)
-        q4.scatter_(2, sel, torch.where(good[:, :, None, None], qnsel[:, :, None, :], oldq))
-        oldl = l34.gather(2, idx[:, :, None]).squeeze(2)
-        l34.scatter_(2, idx[:, :, None], torch.where(good, newsel, oldl)[:, :, None])
-        mf = mav.reshape(rows, ng, 64, 4)
-        sfv = sgv.reshape(rows, ng, 64, 4)
-        oldm = mf.gather(2, sel)
-        olds = sfv.gather(2, sel)
-        mf.scatter_(2, sel, torch.where(good[:, :, None, None], masel[:, :, None, :], oldm))
-        sfv.scatter_(2, sel, torch.where(good[:, :, None, None], sgsel[:, :, None, :], olds))
-        mav = mf.reshape(rows, nb, 8, 2, 4)
-        sgv = sfv.reshape(rows, nb, 8, 2, 4)
-        l3 = l34.reshape(rows, nb, 8, 2)
-    pp['scale_lv3'] = l3.reshape_as(pp['scale_lv3']).to(torch.bfloat16)
-    pp['sign'] = sgv.reshape_as(pp['sign']).to(torch.bfloat16)
-    pp['mant'] = mav.reshape_as(pp['mant']).to(torch.bfloat16)
-    return pp
+def _v156_linear(weight_quant, weight_scale, calib_activation_list):
+    """
+    Offline Linear weight quantization with a single full-width Hessian.
+    """
+    w = dequantize_nvfp4(weight_quant, weight_scale).float()
+    acts = _rule_safe_decode_acts(
+        calib_activation_list, w.shape[-1], w.device,
+    )
+    s, perm, had, ph, post, wt, acts_t = _safe147_geometry(
+        w, acts,
+        perm_kind='mass_act',
+        post_pressure='max',
+        robust_phase_mix=0.0,
+    )
+
+    k = int(w.shape[-1])
+
+    # Full activation covariance: [1, k, k].
+    Hfull, rfull = _v156_cov_adaptive(
+        acts_t, k, w.device,
+        group=k,
+        alpha=0.5,
+        rmin=0.4,
+        rmax=0.8,
+        noise_gain=1.0,
+    )
+
+    # Common Self-MSE initialization.
+    wp, _ = _quantize_tensor_self_mse(wt, return_dequant=True)
+
+    # Every row chunk uses the same full H[k, k].
+    if isinstance(Hfull, torch.Tensor) and tuple(Hfull.shape) == (1, k, k):
+        HH = Hfull[0].to(w.device, torch.float32)
+        out = _v64_clone_params(wp)
+        chunk_rows = 128
+
+        for rs in range(0, int(wt.shape[0]), chunk_rows):
+            re = min(rs + chunk_rows, int(wt.shape[0]))
+            pc = {
+                name: value[rs:re].clone()
+                for name, value in out.items()
+            }
+            pc = _refine_activation_full_hessian(
+                wt[rs:re],
+                pc,
+                HH,
+                mantissa_iters=4,
+                block_batch=4,
+            )
+            for name in out:
+                out[name][rs:re] = pc[name]
+
+        wp = out
+
+    st = _safe90_make_state(
+        'v156_full_hessian_weight',
+        s,
+        perm,
+        had,
+        ph,
+        transform_kind='safe_v40_marginal',
+        post_perm=post.detach().cpu().to(torch.int32),
+        post_perm_enabled=True,
+        full_weight_hessian=True,
+        rho_full_mean=(
+            float(rfull.mean())
+            if isinstance(rfull, torch.Tensor)
+            else 0.0
+        ),
+    )
+
+    return {
+        'weight_params': wp,
+        'activation_state': st,
+    }
+
+
 
 def _v158_dynamic_tensor_h256(y, H64, H256, lv3_iters=2, base_mant_iters=4):
     if not isinstance(H64, torch.Tensor):
@@ -1135,11 +1033,11 @@ def _v158_dynamic_tensor_h256(y, H64, H256, lv3_iters=2, base_mant_iters=4):
     p, _ = _v37_quantize_hessian(y, H64.to(y.device), return_dequant=False)
     if isinstance(H256, torch.Tensor):
         H = H256.to(y.device, torch.float32)
-        p = _safe90_refine256(y, p, H, int(base_mant_iters))
+        
         p = _safe130_scale_core(y, p, H, 1)
-        p = _safe90_refine256(y, p, H, 1)
-        p = _v158_lv3_greedy(y, p, H, int(lv3_iters))
-        p = _safe90_refine256(y, p, H, 1)
+        
+        
+        
     return p
 
 def _v159_dynamic_k(k_quant, k_scale, kv_num_heads, head_dim, k_state, lv3_iters=1):
@@ -1181,409 +1079,69 @@ def hif4_dynamic_quantize_q(q_quant, q_scale, q_num_heads, head_dim, q_state):
 def hif4_dynamic_quantize_k(k_quant, k_scale, kv_num_heads, head_dim, k_state):
     return _v159_dynamic_k(k_quant, k_scale, kv_num_heads, head_dim, k_state, 1)
 
-def _v160_lv2_once(y, p, H256):
-    shape = tuple((int(s) for s in y.shape))
-    k = shape[-1]
-    if y.dim() != 2 or k % 256 or (not isinstance(H256, torch.Tensor)):
-        return p
-    rows = int(y.shape[0])
-    ng = k // 256
-    nb = k // 64
-    H = H256.to(y.device, torch.float32)
-    pp = _v64_clone_params(p)
-    yy = y.float().reshape(rows, ng, 256)
-    q = _v64_dequant_params(pp, shape).float().reshape(rows, ng, 256)
-    g = torch.einsum('gij,rgi->rgj', H, q - yy)
-    sf = pp['scale_factor'].float().reshape(rows, nb)
-    l2 = pp['scale_lv2'].float().reshape(rows, nb, 8)
-    l3 = pp['scale_lv3'].float().reshape(rows, nb, 8, 2)
-    sgv = pp['sign'].float().reshape(rows, nb, 8, 2, 4)
-    mav = pp['mant'].float().reshape(rows, nb, 8, 2, 4)
-    sf8 = sf.reshape(rows, ng, 4, 1).expand(rows, ng, 4, 8).reshape(rows, ng, 32)
-    l28 = l2.reshape(rows, ng, 32)
-    l38 = l3.reshape(rows, ng, 32, 2)
-    z8 = yy.reshape(rows, ng, 32, 8)
-    q8 = q.reshape(rows, ng, 32, 8)
-    new = torch.where(l28 > 1.5, torch.ones_like(l28), torch.full_like(l28, 2.0))
-    eff = (sf8 * new)[:, :, :, None, None] * l38[:, :, :, :, None]
-    zz = z8.reshape(rows, ng, 32, 2, 4)
-    ma = (torch.round(zz.abs() / eff.clamp_min(2.0 ** (-48)) * 4.0) * 0.25).clamp(0.0, 1.75)
-    sg = torch.where(ma == 0.0, torch.zeros_like(zz), torch.sign(zz))
-    qn = (sg * ma * eff).reshape(rows, ng, 32, 8)
-    d = qn - q8
-    g8 = g.reshape(rows, ng, 32, 8)
-    H8 = torch.stack([H[:, i * 8:(i + 1) * 8, i * 8:(i + 1) * 8] for i in range(32)], dim=1)
-    delta = 2.0 * (d * g8).sum(-1) + torch.einsum('rgbi,gbij,rgbj->rgb', d, H8, d)
-    best, idx = delta.min(-1)
-    good = best < -1e-08
-    sel = idx[:, :, None, None].expand(rows, ng, 1, 8)
-    newsel = new.gather(2, idx[:, :, None]).squeeze(2)
-    oldl = l28.gather(2, idx[:, :, None]).squeeze(2)
-    l28.scatter_(2, idx[:, :, None], torch.where(good, newsel, oldl)[:, :, None])
-    mf = mav.reshape(rows, ng, 32, 8)
-    sfv = sgv.reshape(rows, ng, 32, 8)
-    masel = ma.reshape(rows, ng, 32, 8).gather(2, sel).squeeze(2)
-    sgsel = sg.reshape(rows, ng, 32, 8).gather(2, sel).squeeze(2)
-    oldm = mf.gather(2, sel)
-    olds = sfv.gather(2, sel)
-    mf.scatter_(2, sel, torch.where(good[:, :, None, None], masel[:, :, None, :], oldm))
-    sfv.scatter_(2, sel, torch.where(good[:, :, None, None], sgsel[:, :, None, :], olds))
-    pp['scale_lv2'] = l28.reshape_as(pp['scale_lv2']).to(torch.bfloat16)
-    pp['sign'] = sfv.reshape_as(pp['sign']).to(torch.bfloat16)
-    pp['mant'] = mf.reshape_as(pp['mant']).to(torch.bfloat16)
-    return pp
 
-def _v162_dynamic_activation(aq, asc, st):
-    st = st if isinstance(st, dict) else {}
-    y = _safe90_decode_transform_activation(aq, asc, st)
-    post = st.get('post_perm')
-    if isinstance(post, torch.Tensor):
-        y = y.index_select(-1, post.to(y.device, dtype=torch.long))
-    H64 = st.get('weight_hessian_blocks')
-    H256 = st.get('super256_hessian_blocks')
-    p = _v158_dynamic_tensor_h256(y, H64, H256, lv3_iters=2, base_mant_iters=4)
-    if isinstance(H256, torch.Tensor):
-        H = H256.to(y.device, torch.float32)
-        for _ in range(2):
-            p = _v160_lv2_once(y, p, H)
-            p = _safe90_refine256(y, p, H, 1)
-            p = _v158_lv3_greedy(y, p, H, 1)
-            p = _safe90_refine256(y, p, H, 1)
-        p = _safe130_scale_core(y, p, H, 1)
-        p = _safe90_refine256(y, p, H, 1)
-        p = _v158_lv3_greedy(y, p, H, 1)
-        p = _safe90_refine256(y, p, H, 1)
-    return p
 
-def _v164_pair_mant256(y, p, H256, iters=2, topk=6):
-    shape = tuple((int(s) for s in y.shape))
-    k = shape[-1]
-    if y.dim() != 2 or k % 256 or (not isinstance(H256, torch.Tensor)):
-        return p
-    rows = int(y.shape[0])
-    ng = k // 256
-    nb = k // 64
-    H = H256.to(y.device, torch.float32)
-    pp = _v64_clone_params(p)
-    sf = pp['scale_factor'].float().reshape(rows, nb, 1, 1, 1)
-    l2 = pp['scale_lv2'].float().reshape(rows, nb, 8, 1, 1)
-    l3 = pp['scale_lv3'].float().reshape(rows, nb, 8, 2, 1)
-    eff = (sf * l2 * l3).expand(rows, nb, 8, 2, 4).reshape(rows, ng, 256)
-    u = (pp['sign'].float() * pp['mant'].float()).reshape(rows, ng, 256)
-    yy = y.float().reshape(rows, ng, 256)
-    g = torch.einsum('gij,rgi->rgj', H, u * eff - yy)
-    diag = H.diagonal(dim1=-2, dim2=-1).unsqueeze(0)
-    K = int(topk)
-    gg = torch.arange(ng, device=y.device).view(1, ng, 1, 1)
-    for _ in range(int(iters)):
-        for sub in range(4):
-            lo = sub * 64
-            hi = lo + 64
-            es = eff[:, :, lo:hi]
-            us = u[:, :, lo:hi]
-            gs = g[:, :, lo:hi]
-            ds = diag[:, :, lo:hi]
-            step = 0.25 * es
-            dp = 2 * step * gs + step.square() * ds
-            dm = -2 * step * gs + step.square() * ds
-            dp = dp.masked_fill(us >= 1.75 - 1e-06, float('inf'))
-            dm = dm.masked_fill(us <= -1.75 + 1e-06, float('inf'))
-            cand = torch.cat([dp, dm], -1)
-            kk = min(K, int(cand.shape[-1]))
-            vals, idx = torch.topk(cand, kk, dim=-1, largest=False)
-            coord = idx % 64
-            direction = torch.where(idx < 64, torch.ones_like(vals), -torch.ones_like(vals))
-            de = 0.25 * direction * es.gather(2, coord)
-            Hs = H[:, lo:hi, lo:hi]
-            hij = Hs[gg, coord[:, :, :, None], coord[:, :, None, :]]
-            pcost = vals[:, :, :, None] + vals[:, :, None, :] + 2 * de[:, :, :, None] * de[:, :, None, :] * hij
-            tri = torch.triu(torch.ones((kk, kk), device=y.device, dtype=torch.bool), diagonal=1).view(1, 1, kk, kk)
-            same = coord[:, :, :, None] == coord[:, :, None, :]
-            pcost = pcost.masked_fill(~tri | same, float('inf'))
-            pv, pflat = pcost.reshape(rows, ng, -1).min(-1)
-            pa = pflat // kk
-            pb = pflat % kk
-            single = vals[..., 0]
-            usepair = pv < single
-            best = torch.where(usepair, pv, single)
-            good = best < -1e-08
-            ia = torch.where(usepair, pa, torch.zeros_like(pa))
-            ca = coord.gather(2, ia.unsqueeze(-1)).squeeze(-1)
-            dea = de.gather(2, ia.unsqueeze(-1)).squeeze(-1) * good
-            ib = pb
-            cb = coord.gather(2, ib.unsqueeze(-1)).squeeze(-1)
-            hasb = good & usepair
-            deb = de.gather(2, ib.unsqueeze(-1)).squeeze(-1) * hasb
-            eca = es.gather(2, ca.unsqueeze(-1)).squeeze(-1).clamp_min(1e-30)
-            ecb = es.gather(2, cb.unsqueeze(-1)).squeeze(-1).clamp_min(1e-30)
-            u[:, :, lo:hi].scatter_add_(2, ca.unsqueeze(-1), (dea / eca).unsqueeze(-1))
-            u[:, :, lo:hi].scatter_add_(2, cb.unsqueeze(-1), (deb / ecb).unsqueeze(-1))
-            devec = torch.zeros((rows, ng, 64), device=y.device, dtype=torch.float32)
-            devec.scatter_add_(2, ca.unsqueeze(-1), dea.unsqueeze(-1))
-            devec.scatter_add_(2, cb.unsqueeze(-1), deb.unsqueeze(-1))
-            g.add_(torch.einsum('gij,rgj->rgi', H[:, :, lo:hi], devec))
-    ma = u.abs().reshape(rows, nb, 64)
-    sg = torch.sign(u).reshape(rows, nb, 64)
-    sg = torch.where(ma == 0, torch.zeros_like(sg), sg)
-    pp['mant'] = ma.reshape_as(pp['mant']).to(torch.bfloat16)
-    pp['sign'] = sg.reshape_as(pp['sign']).to(torch.bfloat16)
-    return pp
 
-def _v165_pair_lv2_once(y, p, H256, topk=3):
-    shape = tuple((int(s) for s in y.shape))
-    k = shape[-1]
-    if y.dim() != 2 or k % 256 or (not isinstance(H256, torch.Tensor)):
-        return p
-    rows = int(y.shape[0])
-    ng = k // 256
-    nb = k // 64
-    H = H256.to(y.device, torch.float32)
-    pp = _v64_clone_params(p)
-    yy = y.float().reshape(rows, ng, 256)
-    q = _v64_dequant_params(pp, shape).float().reshape(rows, ng, 256)
-    g = torch.einsum('gij,rgi->rgj', H, q - yy)
-    sf = pp['scale_factor'].float().reshape(rows, nb)
-    l2 = pp['scale_lv2'].float().reshape(rows, nb, 8)
-    l3 = pp['scale_lv3'].float().reshape(rows, nb, 8, 2)
-    sgv = pp['sign'].float().reshape(rows, nb, 8, 2, 4)
-    mav = pp['mant'].float().reshape(rows, nb, 8, 2, 4)
-    sf8 = sf.reshape(rows, ng, 4, 1).expand(rows, ng, 4, 8).reshape(rows, ng, 32)
-    l28 = l2.reshape(rows, ng, 32)
-    l38 = l3.reshape(rows, ng, 32, 2)
-    z8 = yy.reshape(rows, ng, 32, 2, 4)
-    q8 = q.reshape(rows, ng, 32, 8)
-    new = torch.where(l28 > 1.5, torch.ones_like(l28), torch.full_like(l28, 2.0))
-    eff = (sf8 * new)[:, :, :, None, None] * l38[:, :, :, :, None]
-    ma = (torch.round(z8.abs() / eff.clamp_min(2 ** (-48)) * 4.0) * 0.25).clamp(0, 1.75)
-    sg = torch.where(ma == 0, torch.zeros_like(z8), torch.sign(z8))
-    qn = (sg * ma * eff).reshape(rows, ng, 32, 8)
-    d = qn - q8
-    g8 = g.reshape(rows, ng, 32, 8)
-    H8 = H.reshape(ng, 32, 8, 32, 8).permute(0, 1, 3, 2, 4)
-    diag8 = H8[:, torch.arange(32, device=y.device), torch.arange(32, device=y.device)]
-    delta = 2 * (d * g8).sum(-1) + torch.einsum('rgbi,gbij,rgbj->rgb', d, diag8, d)
-    K = min(int(topk), 32)
-    vals, idx = torch.topk(delta, K, dim=-1, largest=False)
-    dsel = d.gather(2, idx[:, :, :, None].expand(rows, ng, K, 8))
-    gg = torch.arange(ng, device=y.device).view(1, ng)
-    best = vals[..., 0]
-    bi = torch.zeros_like(idx[..., 0])
-    bj = torch.full_like(bi, -1)
-    for a in range(K):
-        ia = idx[..., a]
-        da = dsel[..., a, :]
-        va = vals[..., a]
-        for b in range(a + 1, K):
-            ib = idx[..., b]
-            db = dsel[..., b, :]
-            vb = vals[..., b]
-            Hab = H8[gg, ia, ib]
-            pv = va + vb + 2 * torch.einsum('rgi,rgij,rgj->rg', da, Hab, db)
-            better = pv < best
-            best = torch.where(better, pv, best)
-            bi = torch.where(better, torch.full_like(bi, a), bi)
-            bj = torch.where(better, torch.full_like(bj, b), bj)
-    good = best < -1e-08
-    mf = mav.reshape(rows, ng, 32, 8)
-    sfv = sgv.reshape(rows, ng, 32, 8)
-    for which in (0, 1):
-        pos = bi if which == 0 else bj
-        has = good if which == 0 else good & (bj >= 0)
-        pos = pos.clamp_min(0)
-        grp = idx.gather(2, pos[:, :, None]).squeeze(2)
-        sel = grp[:, :, None, None].expand(rows, ng, 1, 8)
-        mas = ma.reshape(rows, ng, 32, 8).gather(2, sel).squeeze(2)
-        sgs = sg.reshape(rows, ng, 32, 8).gather(2, sel).squeeze(2)
-        news = new.gather(2, grp[:, :, None]).squeeze(2)
-        old = l28.gather(2, grp[:, :, None]).squeeze(2)
-        l28.scatter_(2, grp[:, :, None], torch.where(has, news, old)[:, :, None])
-        oldm = mf.gather(2, sel)
-        olds = sfv.gather(2, sel)
-        mf.scatter_(2, sel, torch.where(has[:, :, None, None], mas[:, :, None, :], oldm))
-        sfv.scatter_(2, sel, torch.where(has[:, :, None, None], sgs[:, :, None, :], olds))
-    pp['scale_lv2'] = l28.reshape_as(pp['scale_lv2']).to(torch.bfloat16)
-    pp['mant'] = mf.reshape_as(pp['mant']).to(torch.bfloat16)
-    pp['sign'] = sfv.reshape_as(pp['sign']).to(torch.bfloat16)
-    return pp
 
-def _v165_dynamic_activation(aq, asc, st):
-    st = st if isinstance(st, dict) else {}
-    y = _safe90_decode_transform_activation(aq, asc, st)
-    post = st.get('post_perm')
-    if isinstance(post, torch.Tensor):
-        y = y.index_select(-1, post.to(y.device, dtype=torch.long))
-    p = _v162_dynamic_activation(aq, asc, st)
-    H = st.get('super256_hessian_blocks')
-    if isinstance(H, torch.Tensor):
-        H = H.to(y.device, torch.float32)
-        p = _v165_pair_lv2_once(y, p, H, 3)
-        p = _safe90_refine256(y, p, H, 2)
-        p = _v158_lv3_greedy(y, p, H, 1)
-        p = _safe90_refine256(y, p, H, 1)
-        p = _v164_pair_mant256(y, p, H, 2, 6)
-        p = _safe90_refine256(y, p, H, 2)
-    return p
 
-def _v167_weight_hierarchy(weight_quant, weight_scale, calib_activation_list):
-    base = _v156_linear(weight_quant, weight_scale, calib_activation_list)
-    p = base['weight_params']
-    st0 = base['activation_state']
-    w = dequantize_nvfp4(weight_quant, weight_scale).float()
-    acts = _rule_safe_decode_acts(calib_activation_list, w.shape[-1], w.device)
-    wt = _safe90_apply(w, st0['smooth'].to(w.device), st0['perm'].to(w.device, dtype=torch.long), st0['block_phase'].to(w.device), bool(st0.get('hadamard64', False)), True)
-    post = st0.get('post_perm')
-    if isinstance(post, torch.Tensor):
-        wt = wt.index_select(-1, post.to(w.device, dtype=torch.long))
-    acts_t = []
-    for aq, asc in calib_activation_list:
-        at = _safe90_decode_transform_activation(aq, asc, st0)
-        if isinstance(post, torch.Tensor):
-            at = at.index_select(-1, post.to(at.device, dtype=torch.long))
-        acts_t.append(at)
-    H256, _ = _v156_cov_adaptive(acts_t, int(w.shape[-1]), w.device, 256, 0.5, 0.4, 0.8, 1.0)
-    if isinstance(H256, torch.Tensor):
-        H = H256.to(w.device, torch.float32)
-        p = _v165_pair_lv2_once(wt, p, H, 3)
-        p = _safe90_refine256(wt, p, H, 2)
-        p = _v158_lv3_greedy(wt, p, H, 1)
-        p = _safe90_refine256(wt, p, H, 1)
-        p = _v164_pair_mant256(wt, p, H, 2, 6)
-        p = _safe90_refine256(wt, p, H, 2)
-    wq = _v64_dequant_params(p, tuple(w.shape)).float()
-    st = _safe105_make_state('v167_weight_hierarchy_pairwise', st0['smooth'].to(w.device), st0['perm'].to(w.device, dtype=torch.long), bool(st0.get('hadamard64', False)), st0['block_phase'].to(w.device), wq, {'post_perm': st0['post_perm'], 'post_perm_enabled': True, 'offline_weight_hierarchy_refined': True})
-    return {'weight_params': p, 'activation_state': st}
 
-def _v173_cov_blocks(xs, k, device, group=512):
-    if not xs or k % int(group):
-        return None
-    ng = k // int(group)
-    H = torch.zeros((ng, group, group), device=device, dtype=torch.float32)
-    denom = 0.0
-    for x in xs:
-        z = x.float().reshape(-1, ng, group)
-        n = max(int(z.shape[0]), 1)
-        wt = float(n) ** 0.5
-        H.add_(torch.einsum('rgi,rgj->gij', z, z) * (wt / float(n)))
-        denom += wt
-    H.div_(max(denom, 1e-20))
-    sc = H.diagonal(dim1=-2, dim2=-1).mean(-1).abs().clamp_min(1e-12)
-    H = H / sc[:, None, None]
-    D = torch.diag_embed(H.diagonal(dim1=-2, dim2=-1))
-    return 0.6 * H + 0.4 * D
 
-def _v173_weight_gram_blocks(wq, group=512):
-    if wq.dim() != 2 or int(wq.shape[-1]) % int(group):
-        return None
-    m, k = map(int, wq.shape)
-    ng = k // int(group)
-    z = wq.float().reshape(m, ng, group)
-    H = torch.einsum('mgi,mgj->gij', z, z)
-    sc = H.diagonal(dim1=-2, dim2=-1).mean(-1).abs().clamp_min(1e-12)
-    return H / sc[:, None, None]
 
-def _v173_refine_group(y, p, H, group=512, iters=2):
-    shape = tuple((int(s) for s in y.shape))
-    k = shape[-1]
-    if y.dim() != 2 or k % int(group) or (not isinstance(H, torch.Tensor)):
-        return p
-    rows = int(y.shape[0])
-    ng = k // int(group)
-    nb = k // 64
-    if tuple(H.shape) != (ng, group, group):
-        return p
-    pp = _v64_clone_params(p)
-    sf = pp['scale_factor'].float().reshape(rows, nb, 1, 1, 1)
-    l2 = pp['scale_lv2'].float().reshape(rows, nb, 8, 1, 1)
-    l3 = pp['scale_lv3'].float().reshape(rows, nb, 8, 2, 1)
-    eff = (sf * l2 * l3).expand(rows, nb, 8, 2, 4).reshape(rows, ng, group)
-    u = (pp['sign'].float() * pp['mant'].float()).reshape(rows, ng, group)
-    yy = y.float().reshape(rows, ng, group)
-    HH = H.to(y.device, torch.float32)
-    g = torch.einsum('gij,rgi->rgj', HH, u * eff - yy)
-    diag = HH.diagonal(dim1=-2, dim2=-1).unsqueeze(0)
-    step = 0.25 * eff
-    step2 = step.square() * diag
-    gi = torch.arange(ng, device=y.device).view(1, ng).expand(rows, ng)
-    for _ in range(int(iters)):
-        for lo in range(0, group, 64):
-            hi = lo + 64
-            base = 2.0 * step[:, :, lo:hi] * g[:, :, lo:hi]
-            dp = base + step2[:, :, lo:hi]
-            dm = -base + step2[:, :, lo:hi]
-            us = u[:, :, lo:hi]
-            dp.masked_fill_(us >= 1.75 - 1e-06, float('inf'))
-            dm.masked_fill_(us <= -1.75 + 1e-06, float('inf'))
-            plus = dp < dm
-            best, j0 = torch.minimum(dp, dm).min(dim=2)
-            good = best < -1e-08
-            direction = torch.where(plus.gather(2, j0.unsqueeze(-1)).squeeze(-1), torch.ones_like(best), -torch.ones_like(best))
-            du = 0.25 * direction * good
-            j = j0 + lo
-            u.scatter_add_(2, j.unsqueeze(-1), du.unsqueeze(-1))
-            de = du * eff.gather(2, j.unsqueeze(-1)).squeeze(-1)
-            g.add_(HH[gi, :, j] * de.unsqueeze(-1))
-    ma = u.abs().reshape(rows, nb, 64)
-    sg = torch.sign(u).reshape(rows, nb, 64)
-    sg = torch.where(ma == 0.0, torch.zeros_like(sg), sg)
-    pp['mant'] = ma.reshape_as(pp['mant']).to(torch.bfloat16)
-    pp['sign'] = sg.reshape_as(pp['sign']).to(torch.bfloat16)
-    return pp
 
-def _v174_chunk_weight(y, p, H, group=1024, chunk_rows=128, iters=2):
-    out = _v64_clone_params(p)
-    for rs in range(0, int(y.shape[0]), int(chunk_rows)):
-        re = min(rs + int(chunk_rows), int(y.shape[0]))
-        pc = {name: value[rs:re].clone() for name, value in out.items()}
-        pc = _v173_refine_group(y[rs:re], pc, H, group, iters)
-        for name in out:
-            out[name][rs:re] = pc[name]
-    return out
 
-def hif4_calibration_and_quantize_weight(weight_quant, weight_scale, calib_activation_list):
-    base = _v167_weight_hierarchy(weight_quant, weight_scale, calib_activation_list)
+
+def hif4_calibration_and_quantize_weight(
+    weight_quant,
+    weight_scale,
+    calib_activation_list,
+):
+    """
+    Full-H-only Linear calibration.
+
+    Offline weight optimization uses the full activation covariance.
+    Dynamic activation optimization uses the full Wq^T Wq metric.
+    """
+    base = _v156_linear(
+        weight_quant,
+        weight_scale,
+        calib_activation_list,
+    )
     p = base['weight_params']
     st = base['activation_state']
-    w = dequantize_nvfp4(weight_quant, weight_scale).float()
-    wt = _safe90_apply(w, st['smooth'].to(w.device), st['perm'].to(w.device, dtype=torch.long), st['block_phase'].to(w.device), bool(st.get('hadamard64', False)), True)
-    post = st.get('post_perm')
-    if isinstance(post, torch.Tensor):
-        wt = wt.index_select(-1, post.to(w.device, dtype=torch.long))
-    acts = []
-    for aq, asc in calib_activation_list:
-        a = _safe90_decode_transform_activation(aq, asc, st)
-        if isinstance(post, torch.Tensor):
-            a = a.index_select(-1, post.to(a.device, dtype=torch.long))
-        acts.append(a)
-    HA1024 = _v173_cov_blocks(acts, int(w.shape[-1]), w.device, 1024)
-    if isinstance(HA1024, torch.Tensor):
-        p = _v174_chunk_weight(wt, p, HA1024, 1024, 128, 2)
-    wq = _v64_dequant_params(p, tuple((int(s) for s in weight_quant.shape))).float()
-    # Final public activation metric uses one representation for every width:
-    #   hessian_blocks.shape == [num_groups, group, group]
-    # A full Hessian is simply num_groups=1 and group=k.  Larger widths fall
-    # back to 1024/256/64 block-diagonal metrics without changing state format.
+
+    wq = _v64_dequant_params(
+        p,
+        tuple(int(s) for s in weight_quant.shape),
+    ).float()
+
     for key in (
-        'weight_hessian_blocks', 'super256_hessian_blocks',
-        'super512_hessian_blocks', 'super1024_hessian_blocks',
-        'cross1024_hessian_blocks', 'full_hessian', 'hessian_blocks',
+        'weight_hessian_blocks',
+        'super256_hessian_blocks',
+        'super512_hessian_blocks',
+        'super1024_hessian_blocks',
+        'cross1024_hessian_blocks',
+        'full_hessian',
+        'hessian_blocks',
     ):
         st.pop(key, None)
+
     k = int(wq.shape[-1])
     Hblocks = None
-    if k <= 2048 and k % 64 == 0:
+    if k % 64 == 0:
         H = wq.t().matmul(wq)
         scale = H.diagonal().mean().abs().clamp_min(1e-12)
-        Hblocks = (H / scale).unsqueeze(0)  # [1, k, k] == full-H
-    elif k % 1024 == 0:
-        Hblocks = _v173_weight_gram_blocks(wq, 1024)
-    elif k % 256 == 0:
-        Hblocks = _v173_weight_gram_blocks(wq, 256)
-    elif k % 64 == 0:
-        Hblocks = _v173_weight_gram_blocks(wq, 64)
+        Hblocks = (H / scale).unsqueeze(0)
+
     if isinstance(Hblocks, torch.Tensor):
         st['hessian_blocks'] = Hblocks.cpu().to(torch.bfloat16)
-    st['version'] = 'unified_hessian_blocks'
-    return {'weight_params': p, 'activation_state': st}
+        st['full_hessian'] = Hblocks[0].cpu().to(torch.bfloat16)
+
+    st['version'] = 'unified_full_hessian'
+    return {
+        'weight_params': p,
+        'activation_state': st,
+    }
+
 
 def _refine_full_hessian_batched(y, p, H, iters=20, block_batch=4):
     if y.dim() != 2 or int(y.shape[-1]) % 64 != 0:
@@ -1915,35 +1473,69 @@ def _refine_full_lv2_once(y, p, H, q=None, g=None):
     pp['mant'] = mav.reshape_as(pp['mant']).to(torch.bfloat16)
     return pp, q, g
 
+def _refine_activation_full_hessian(y, p, H, *, mantissa_iters=10, block_batch=4):
+    """Run the complete activation refinement against one full Hessian.
+
+    The public activation state stores the metric as [1, k, k] for every
+    supported hidden width.  This helper keeps the dynamic path width-agnostic:
+      1) exact full-H mantissa coordinate descent,
+      2) one shared q/g hierarchy state,
+      3) full-H scale, lv3 and lv2 refinement.
+    """
+    k = int(y.shape[-1])
+    if y.dim() != 2 or k % 64 != 0:
+        return p
+    if not isinstance(H, torch.Tensor) or H.numel() != k * k:
+        return p
+
+    HH = H.to(y.device, torch.float32).reshape(k, k)
+    p = _refine_full_hessian_batched(
+        y, p, HH, int(mantissa_iters), block_batch=int(block_batch),
+    )
+
+    full_state = _full_hierarchy_init(y, p, HH)
+    if full_state is None:
+        return p
+
+    p, q_full, g_full = full_state
+    p, q_full, g_full = _refine_full_scale_once(
+        y, p, HH, q_full, g_full,
+    )
+    p, q_full, g_full = _refine_full_lv3_once(
+        y, p, HH, q_full, g_full,
+    )
+    p, q_full, g_full = _refine_full_lv2_once(
+        y, p, HH, q_full, g_full,
+    )
+    return p
+
+
 def hif4_dynamic_quantize_activation(aq, asc, st):
+    """Dynamic activation quantization using one unified full-H metric.
+
+    All supported hidden widths (64/256/1024/2048/...) use exactly the same
+    path when calibration provides hessian_blocks with shape [1, k, k].
+    Invalid or legacy block-diagonal states simply fall back to the self-MSE
+    initialization instead of taking a different optimization path.
+    """
     st = st if isinstance(st, dict) else {}
+
     y = _safe90_decode_transform_activation(aq, asc, st)
     post = st.get('post_perm')
     if isinstance(post, torch.Tensor):
         y = y.index_select(-1, post.to(y.device, dtype=torch.long))
+
+    # One common initialization for every width.
     p = _quantize_tensor_self_mse(y, return_dequant=False)[0]
+
     Hblocks = st.get('hessian_blocks')
-    if isinstance(Hblocks, torch.Tensor):
-        HB = Hblocks.to(y.device, torch.float32)
-        k = int(y.shape[-1])
-        if HB.dim() == 3:
-            group = int(HB.shape[-1])
-            ng = k // group if group > 0 and k % group == 0 else -1
-            if tuple(HB.shape) == (ng, group, group):
-                if ng == 1:
-                    # Full-H: same state format as block metrics, but use the
-                    # exact global-gradient mantissa + hierarchy refinements.
-                    HH = HB[0]
-                    p = _refine_full_hessian_batched(
-                        y, p, HH, 10, block_batch=4,
-                    )
-                    full_state = _full_hierarchy_init(y, p, HH)
-                    if full_state is not None:
-                        p, q_full, g_full = full_state
-                        p, q_full, g_full = _refine_full_scale_once(y, p, HH, q_full, g_full)
-                        p, q_full, g_full = _refine_full_lv3_once(y, p, HH, q_full, g_full)
-                        p, q_full, g_full = _refine_full_lv2_once(y, p, HH, q_full, g_full)
-                else:
-                    # Block-diagonal fallback: 1024/256/64 all use this path.
-                    p = _v173_refine_group(y, p, HB, group, 10)
-    return p
+    if not isinstance(Hblocks, torch.Tensor):
+        return p
+
+    k = int(y.shape[-1])
+    if tuple(Hblocks.shape) != (1, k, k):
+        return p
+
+    return _refine_activation_full_hessian(
+        y, p, Hblocks[0], mantissa_iters=10, block_batch=4,
+    )
