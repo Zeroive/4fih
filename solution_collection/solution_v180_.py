@@ -493,11 +493,11 @@ def hif4_calibration_attention(calib_qkv_list, q_num_heads, kv_num_heads, head_d
     for q, k, _ in decoded:
         qh = (q.float() * q_scale.to(q.device)).reshape(-1, kv_num_heads, rep, head_dim)
         kh = (k.float() / k_scale.to(k.device)).reshape(-1, kv_num_heads, head_dim)
-        q_energy.add_(qh.square().mean(dim=(0, 2)))
-        k_energy.add_(kh.square().mean(dim=0))
+        q_energy.add_(qh.square().amax(dim=(0, 2)))
+        k_energy.add_(kh.square().amax(dim=0))
     q_rms = torch.sqrt(q_energy / float(len(decoded))).clamp_min(1e-12)
     k_rms = torch.sqrt(k_energy / float(len(decoded))).clamp_min(1e-12)
-    pressure = torch.maximum(q_rms, k_rms)
+    pressure = torch.sqrt(q_rms * k_rms)
     group_perm = torch.stack(
         [_safe139_massdiff_perm(pressure[g], 64) for g in range(kv_num_heads)],
         dim=0,

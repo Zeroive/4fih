@@ -262,6 +262,13 @@ Attention 逐项结果：
 - H64 mass balancing 的五项为 `7.7885e-4 / 4.2349e-4 / 2.8022e-4 / 2.6829e-4 / 2.5073e-4`，平均 `4.00316e-4`，相对 v179 的 `4.00738e-4` 仅改善约0.105%；10/128-token退化，三个长序列改善。完整复测平均 calibration/dynamic 为 `9935.15/1859.81 ms`、总耗时 `43.49 s`。
 - H64版本按“有提升则保存”规则保留为 `solution_collection/solution_v180_.py`，但收益过小、短序列方向不一致且在线增加逐 head gather，因此不替换通用性优先的当前 v179主线。
 
+### v181_：Linear `WqᵀW` cross-target 补偿
+
+- 保留当前 RMS smooth geometry，并修正新增表达式为跨 calibration 样本先平均平方、再开根。动态 Linear 的二次项仍为归一化 `H=WqᵀWq`，额外从同一变换域原始权重 `Wt` 构造 `C=WqᵀWt`，使用 `g=(q-y)H+αy(H-Cᵀ)`，使 activation 量化误差能够补偿一部分 weight 量化误差；mantissa、scale、lv3、lv2 全部共享同一 cross-target gradient。
+- 相同 RMS geometry 下，`α=0` 五项为 `1.8092e-3 / 1.2767e-3 / 8.4706e-4 / 7.7725e-4 / 7.8322e-4`，平均 `1.09869e-3`；直接保存 BF16 `C` 时，`α=0.5` 平均 `1.07900e-3`，改善约1.79%；`α=1.0` 平均 `1.17359e-3`，退化约6.82%，说明完整补偿过强。
+- 最终不分别量化两个大矩阵再在线相减，而是在 calibration 以 FP32 计算并保存 `D=H-Cᵀ`。`α=0.5` 五项进一步改善为 `1.6707e-3 / 1.2029e-3 / 8.0901e-4 / 7.4965e-4 / 7.4965e-4`，平均 `1.03638e-3`，相对同 geometry 的 `α=0` 改善约5.67%，五项全部改善；Attention 五项保持 v179 不变，完整 checker 为10/12。
+- `αyD` 在线只计算一次，并由全部 hierarchy stage复用。activation-only 同进程交错计时中，512-token 为 `1188.19/1184.18 ms`（α=0/0.5），两个1024-token分别为 `2150.80/2207.01 ms` 与 `2134.55/2233.90 ms`，长序列开销约2.6%与4.7%。删除从未读取的重复 `full_hessian` state 后，新增 BF16 `D` 替代该矩阵，state 的大矩阵总容量不增加。该收益版本保存为 `solution_collection/solution_v181_.py`，并作为当前 `solution.py`。
+
 ### v177_：W/A/Q/K/V 反量化重建 MSE
 
 口径为本地 NVFP4 反量化张量经过当前完整变换和 HiF4 量化后再反量化。`变换域`直接比较量化器实际输入，`还原域`撤销 Smooth/permutation/Hadamard/QK reciprocal scale 后与原逻辑张量比较。
@@ -350,6 +357,7 @@ Softmax平均逐行 KL 为 `4.87319e-3`。普通逐元素 MSE随序列长度自�
 | full-Hessian refinement 32轮 | Linear 五项为 `1.8303e-3 / 1.4319e-3 / 1.0342e-3 / 9.5436e-4 / 9.6453e-4`，平均 `1.24306e-3`，相对10轮的 `1.30202e-3` 改善约 `4.53%`；通过数从 `7/12` 提升到 `9/12`。相邻运行 Linear 动态均值从约 `1053 ms` 增至 `2839 ms`，约为 `2.70×`；整轮平均动态时延从 `1461.41 ms` 增至 `2451.19 ms` | 精度有收益，但时延增长过大；恢复10轮，不保存版本 |
 | per-Q-head Attention sensitivity Hessian | 前3个 calibration 样本按 `p²·||V-O||²` 构造每个 Q head 的 Value-aware Hessian，后2个样本按真实非因果 GQA output MSE，在 shared-H 与 sensitivity-H 的 `α=0/0.25/0.5/0.75/1` shrinkage 中逐 head 选择。16 heads 中仅4个选择 `α=0.25`，其余12个保留 shared-H；测试五项为 `7.7818e-4 / 4.1972e-4 / 2.8201e-4 / 2.6927e-4 / 2.5017e-4`，平均 `3.99868e-4`，比 v171/v174 的 `3.98149e-4` 退化约0.43%；Attention calibration 增至约 `25.30 s` | 放弃；held-out calibration 的 per-head 选择仍未泛化，且校准开销过大 |
 | 每个 Q head 提供 K-Hessian候选 | 为2个 KV heads 分别保存其关联8个 Q heads 的独立 `Q_hᵀQ_h`，动态 K 对每个 Hessian各生成一套候选，再使用该 KV group 的聚合 Q-Hessian逐 KV head统一评分；保留原 quotient 与 aggregate-H 候选。新增 state 形状为 `[2,8,256,256]`。五项 Attention MSE 与基线逐项完全一致，平均仍为 `3.98149e-4`；专项动态均值约 `3108.74 ms`，明显高于相邻基线路径约 `1.87–2.15 s` | 放弃；独立 Q-head Hessian候选未击败原候选（或生成相同参数），只有额外时延和约2 MiB state |
+| V attention-weighted feature Full-H | 用校准 `softmax(QK)` 的平方列和为 token 加权，构造每个 KV head 的 `head_dim×head_dim` V covariance；动态 V 比较 Self-MSE 与该 Full-H hierarchy 候选并逐 head 选优。Attention 五项为 `9.9915e-4 / 5.1384e-4 / 3.3836e-4 / 3.1996e-4 / 2.9458e-4`，平均 `4.93181e-4`，比 v179 的 `4.00738e-4` 退化约23.1%；动态均值升至 `2427.46 ms` | 放弃并恢复 v179；真实 V Hessian 位于 token 维且为 `P^T P`，把 token importance 投影为特征 covariance 引入了错误的跨特征耦合 |
 
 ## 历史版本复用验证
 
